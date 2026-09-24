@@ -1,32 +1,56 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+# 项目上下文（可选）
+# AI 生成各工件时会读取这里的内容。
+context: |
+  项目：dsh-service —— DeepSeek Harness Web GUI（`dsh web`）的一键安装与用户级
+  systemd 服务管理项目，面向 Linux（Ubuntu/Debian/AlmaLinux + systemd）与 WSL。
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  技术栈：Bash 5（`set -Eeuo pipefail`）、systemd user unit、nvm + Node 24（默认；
+  Node 22 仍受支持）、npm/pnpm。无编译步骤，无第三方运行时依赖（仅 coreutils / systemd / journalctl）。
 
-# Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+  文件布局：
+    - install.sh —— 单文件安装器。dshctl 以 heredoc 内嵌在其中（唯一来源），安装器主体
+      紧随其后；`--print-dshctl` 可导出内嵌副本用于比对。
+    - tests/run.sh —— 完全离线的端到端测试：桩命令
+      （systemctl/journalctl/npm/node/loginctl/ss/lsof/sudo）+ 临时 HOME。
+    - README.md —— 面向用户的中文文档（配置、命令、排查、安全）。
+
+  约定：
+    - 幂等是第一约束：重复运行 install.sh 必须安全，已完成的步骤跳过，用户自定义配置与
+      单元修改被保留。
+    - 只做用户级改动；除 `loginctl enable-linger` 外不调用 sudo。
+    - 服务只监听 127.0.0.1（上游 dsh web 拒绝 0.0.0.0）；脚本不读取、不写入、不打印任何密钥。
+    - 默认值集中在 ~/.config/dsh-service/config，采用 `: "${VAR:=default}"` 语义，
+      因此环境变量优先于配置文件；install.sh 与 dshctl 共用该文件。
+    - Bash 风格：Tab 缩进、函数内用 local、printf 优先于 echo、一律引号包裹展开、
+      注释与用户可见输出用中文。
+    - 提交信息遵循 Conventional Commits（如 `feat(openspec): ...`）。
+    - 行为改动必须同步扩展 tests/run.sh 并更新 README.md。
+
+  规格语言：规格正文、需求名与场景名使用中文；OpenSpec 的结构关键字
+  （`## Requirements`、`### Requirement:`、`#### Scenario:`、
+  `## ADDED/MODIFIED/REMOVED/RENAMED Requirements`）与规范动词 `SHALL`/`MUST` 保留英文，
+  因为 CLI 按字面解析并对 `SHALL`/`MUST` 做强校验。代码、注释与用户可见输出用中文。
+
+rules:
+  proposal:
+    - 必须包含「非目标（Non-goals）」章节。
+    - 说明受影响的 dshctl 子命令或 install.sh 步骤，并说明是否改动配置键或环境变量覆盖。
+    - 说明兼容性影响——重跑幂等、既有配置文件取值，以及内嵌 dshctl 单一来源的约定。
+  specs:
+    - 需求必须写成外部可观察的契约（参数、文件、退出码、标准输出），而不是 shell 函数内部实现。
+    - 基线能力规格需与当前行为保持一致；行为改动以 delta 形式落在对应能力上。
+  tasks:
+    - 必须包含一项任务，为新增行为扩展 tests/run.sh 的离线覆盖。
+    - 当参数、配置键或用户可见输出发生变化时，必须包含更新 README.md 与 `--help` / usage 文本的任务。
+
+operations:
+  apply:
+    guidance:
+      - 实现完成后运行 `bash tests/run.sh`，并报告通过与失败的数量。
+      - 涉及安装器的改动要验证幂等——第二次运行不得修改任何文件。
+      - 内嵌在 install.sh 中的 dshctl 是唯一来源；不要把手改生成的 ~/.local/bin/dshctl 当作修复手段。
+  archive:
+    guidance:
+      - 归档前确认每项行为改动都被 tests/run.sh 覆盖，并已反映到 README.md。
