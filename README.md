@@ -5,13 +5,13 @@
 **方式一：直接管道执行**（把 URL 换成你的仓库 raw 地址）
 
 ```sh
-curl -fsSL https://raw.gitcode.com/Haraella/dsh-service/raw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Haraella-AI/dsh-service/main/install.sh | bash
 ```
 
 **方式二：克隆后本地执行**
 
 ```sh
-git clone https://gitcode.com/Haraella/dsh-service.git
+git clone https://github.com/Haraella-AI/dsh-service.git
 cd dsh-service && bash install.sh
 ```
 
