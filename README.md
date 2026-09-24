@@ -2,6 +2,8 @@
 
 在 Linux（Ubuntu / Debian / AlmaLinux 等 + systemd）上一键安装 **DeepSeek Harness Web GUI**，并注册为**用户级 systemd 服务**，附带服务管理工具 `dshctl`。
 
+当前版本：**v0.1.0**（`install.sh` 的 `INSTALLER_VERSION` 与内嵌 `dshctl` 的 `DSHCTL_VERSION` 同源同值，由 [scripts/bump-version.sh](scripts/bump-version.sh) 统一维护，见 [版本管理](#版本管理)）
+
 **方式一：直接管道执行**（把 URL 换成你的仓库 raw 地址）
 
 ```sh
@@ -37,6 +39,7 @@ cd dsh-service && bash install.sh
 - [故障排查](#故障排查)
 - [install.sh 选项](#installsh-选项)
 - [测试](#测试)
+- [版本管理](#版本管理)
 - [安全说明](#安全说明)
 
 ---
@@ -404,6 +407,35 @@ bash tests/run.sh
 ```
 
 测试完全离线：用桩命令（`systemctl`/`journalctl`/`npm`/`node`/`loginctl`/`ss`）在临时 HOME 中走完安装、幂等、`dshctl url`、升级回滚、`doctor`、启动崩溃检测、插件重置、导出/导入等路径，不需要网络、systemd 或 root。
+
+## 版本管理
+
+dsh-service 的版本号只有一个来源：`install.sh` 顶部的 `INSTALLER_VERSION` 与内嵌 `dshctl` 的 `DSHCTL_VERSION`（两者必须同值），README 顶部的版本行跟随显示。`dshctl version` / `dshctl --version` 以及导出归档 `manifest` 里的 `DSHCTL_VERSION` 都由这两个常量在运行时生成，无需单独维护。
+
+```sh
+bash scripts/bump-version.sh --check                   # 校验各处版本号一致（只读，不改文件）
+bash scripts/bump-version.sh patch                     # 0.1.0 -> 0.1.1（也可用 minor / major）
+bash scripts/bump-version.sh 0.2.0-rc.1                # 指定版本号；默认拒绝回退，回退需 --force
+bash scripts/bump-version.sh patch --dry-run           # 只演练，不写文件
+bash scripts/bump-version.sh patch --stage             # 写完后 git add install.sh README.md
+```
+
+`install.sh` 一旦有改动，提交时**自动递增 patch**：仓库自带 pre-commit 钩子，按下面方式启用（只改本仓库的本地 git 配置）：
+
+```sh
+bash scripts/install-hooks.sh             # 设置 core.hooksPath=.githooks
+bash scripts/install-hooks.sh --status    # 查看状态
+bash scripts/install-hooks.sh --uninstall # 停用
+```
+
+钩子行为：
+
+- 本次提交改了 `install.sh` 而版本号未变时，自动 `patch` 递增并暂存 `install.sh` / `README.md`；
+- 已手动 bump（暂存版本与 `HEAD` 不同）时只校验各处是否一致，不一致就中断提交；
+- `install.sh` 存在**未暂存**改动时拒绝自动改写，避免把不打算提交的内容一并 `git add`；
+- 跳过：`git commit --no-verify`，或 `DSH_SERVICE_SKIP_VERSION_BUMP=1 git commit ...`。
+
+`bash tests/run.sh` 会校验 `install.sh` 两处常量、README 版本行与导出归档 `manifest` 的版本字段一致，并在临时仓库里验证钩子的自动递增。
 
 ## 安全说明
 

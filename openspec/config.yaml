@@ -27,6 +27,9 @@ context: |
       注释与用户可见输出用中文。
     - 提交信息遵循 Conventional Commits（如 `feat(openspec): ...`）。
     - 行为改动必须同步扩展 tests/run.sh 并更新 README.md。
+    - 版本号只有一个来源：install.sh 的 INSTALLER_VERSION 与内嵌 dshctl 的 DSHCTL_VERSION
+      （同值），README 顶部版本行跟随显示；用 scripts/bump-version.sh 维护，改动 install.sh
+      的提交由 .githooks/pre-commit 自动递增 patch（启用：scripts/install-hooks.sh）。
 
   规格语言：规格正文、需求名与场景名使用中文；OpenSpec 的结构关键字
   （`## Requirements`、`### Requirement:`、`#### Scenario:`、

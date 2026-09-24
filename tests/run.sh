@@ -14,6 +14,26 @@ WORK="$ROOT/.tmp/tests"
 rm -rf -- "$WORK"
 mkdir -p -- "$WORK/bin" "$WORK/node/lib/node_modules/@deepseek-ai/dsh/lib"
 
+# 版本号唯一来源是 install.sh（scripts/bump-version.sh 统一维护），测试不得写死，
+# 否则每次 bump 都要改测试。
+installer_version_of() { awk -F'"' '/^INSTALLER_VERSION="/{print $2; exit}' "$1"; }
+dshctl_version_of() { awk -F'"' '/^DSHCTL_VERSION="/{print $2; exit}' "$1"; }
+readme_version_of() {
+	awk '
+		/^当前版本：\*\*v/ {
+			v = $0
+			sub(/^当前版本：\*\*v/, "", v)
+			sub(/\*\*.*$/, "", v)
+			print v
+			exit
+		}
+	' "$1"
+}
+INSTALLER_VERSION="$(installer_version_of "$ROOT/install.sh")"
+EMBED_DSHCTL_VERSION="$(dshctl_version_of "$ROOT/install.sh")"
+IFS=. read -r VER_MAJOR VER_MINOR VER_PATCH <<<"$INSTALLER_VERSION"
+NEXT_PATCH_VERSION="$VER_MAJOR.$VER_MINOR.$((VER_PATCH + 1))"
+
 PASS=0
 FAIL=0
 
@@ -28,7 +48,9 @@ assert_eq() {
 	fi
 }
 assert_contains() {
-	if printf '%s' "$2" | grep -qF -- "$1"; then
+	# 用 [[ == ]] 而不是 printf|grep -qF：grep 命中即退出会让 printf 收到 SIGPIPE，
+	# 在 set -o pipefail 下把「包含」误判成失败（大输出时必现）。
+	if [[ "$2" == *"$1"* ]]; then
 		ok "$3"
 	else
 		bad "$3（未包含 [$1]）"
@@ -36,7 +58,7 @@ assert_contains() {
 	fi
 }
 assert_not_contains() {
-	if printf '%s' "$2" | grep -qF -- "$1"; then
+	if [[ "$2" == *"$1"* ]]; then
 		bad "$3（不应包含 [$1]）"
 	else
 		ok "$3"
@@ -53,7 +75,8 @@ assert_symlink_to() {
 	fi
 }
 count_of() {
-	printf '%s' "$2" | grep -cF -- "$1" || true
+	# here-string 而不是 printf|grep：避免同样的 SIGPIPE 误判。
+	grep -cF -- "$1" <<<"$2" || true
 }
 # nvm 桩的调用记录（安装次数用于断言重试行为）
 reset_nvm_log() {
@@ -515,7 +538,7 @@ section '5. dshctl url'
 URL="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" url)"
 assert_eq "$URL" 'http://127.0.0.1:3080/?token=TESTTOKEN123' 'url 取根因链接而非 LAN'
 assert_eq "$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" url --plain)" 'http://127.0.0.1:3080/' 'url --plain 去掉 token'
-assert_contains "dshctl : 0.1.0" "$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" version)" 'version 输出'
+assert_contains "dshctl : $INSTALLER_VERSION" "$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" version)" 'version 输出'
 if HOME="$HOME3" "$HOME3/.local/bin/dshctl" nope >/dev/null 2>&1; then bad '未知命令应退出 2'; else ok '未知命令退出非 0'; fi
 
 section '5b. journal 权限受限时回退到 sudo'
@@ -1211,6 +1234,7 @@ assert_not_contains 'session.lock' "$EXP_MEMBERS" '不导出会话锁文件'
 assert_not_contains '.credentials.yaml' "$EXP_MEMBERS" '默认不导出凭证'
 assert_contains 'INCLUDE_SECRETS=0' "$(tar -xzOf "$EXP_DIR/default.tgz" manifest)" 'manifest 标注不含凭证'
 assert_contains 'SERVICE_PORT=3080' "$(tar -xzOf "$EXP_DIR/default.tgz" manifest)" 'manifest 记录可移植配置'
+assert_contains "DSHCTL_VERSION=$EMBED_DSHCTL_VERSION" "$(tar -xzOf "$EXP_DIR/default.tgz" manifest)" 'manifest 版本字段跟随 install.sh'
 
 # --with-secrets / --no-sessions
 HOME="$HOME3" "$HOME3/.local/bin/dshctl" export -o "$EXP_DIR/sec.tgz" --with-secrets --no-sessions >/dev/null 2>&1
@@ -1355,6 +1379,104 @@ assert_contains 'DSH_SERVICE_MIRROR        = 1' \
 	"$(HOME="$NOMIRROR_HOME" "$NOMIRROR_HOME/.local/bin/dshctl" config)" '--mirror 从官方配置切回镜像'
 assert_contains 'DSH_SERVICE_NPM_REGISTRY  = https://registry.npmmirror.com' \
 	"$(HOME="$NOMIRROR_HOME" "$NOMIRROR_HOME/.local/bin/dshctl" config)" '--mirror 覆盖配置里的官方 registry'
+
+# ── 32. 版本号统一维护 ────────────────────────────────────────────────────────
+section '32. 版本号统一维护'
+
+assert_eq "$EMBED_DSHCTL_VERSION" "$INSTALLER_VERSION" 'install.sh 两处版本号同值'
+assert_eq "$(readme_version_of "$ROOT/README.md")" "$INSTALLER_VERSION" 'README 版本行与 install.sh 同值'
+if DSH_SERVICE_ROOT="$ROOT" bash "$ROOT/scripts/bump-version.sh" --check >/dev/null 2>&1; then
+	ok 'bump-version.sh --check 通过'
+else
+	bad 'bump-version.sh --check 应通过'
+fi
+
+# 在临时副本上演练 bump：不得改动真实仓库。
+VER_ROOT="$WORK/version-root"
+rm -rf "$VER_ROOT"
+mkdir -p "$VER_ROOT/scripts"
+cp -p "$ROOT/install.sh" "$ROOT/README.md" "$VER_ROOT/"
+cp -p "$ROOT/scripts/bump-version.sh" "$VER_ROOT/scripts/"
+VER_BEFORE="$(sha256sum "$VER_ROOT/install.sh" "$VER_ROOT/README.md")"
+VER_DRY="$(DSH_SERVICE_ROOT="$VER_ROOT" bash "$VER_ROOT/scripts/bump-version.sh" patch --dry-run 2>&1)"
+assert_contains '未写入任何文件' "$VER_DRY" 'dry-run 提示不写盘'
+assert_eq "$(sha256sum "$VER_ROOT/install.sh" "$VER_ROOT/README.md")" "$VER_BEFORE" 'dry-run 后文件未变'
+
+VER_BUMP="$(DSH_SERVICE_ROOT="$VER_ROOT" bash "$VER_ROOT/scripts/bump-version.sh" patch 2>&1)"
+assert_contains "v$INSTALLER_VERSION -> v$NEXT_PATCH_VERSION" "$VER_BUMP" 'patch 递增一位'
+assert_eq "$(installer_version_of "$VER_ROOT/install.sh")" "$NEXT_PATCH_VERSION" 'install.sh 的 INSTALLER_VERSION 已更新'
+assert_eq "$(dshctl_version_of "$VER_ROOT/install.sh")" "$NEXT_PATCH_VERSION" '内嵌 DSHCTL_VERSION 已更新'
+assert_eq "$(readme_version_of "$VER_ROOT/README.md")" "$NEXT_PATCH_VERSION" 'README 版本行已更新'
+assert_contains "DSHCTL_VERSION=\"$NEXT_PATCH_VERSION\"" \
+	"$(bash "$VER_ROOT/install.sh" --print-dshctl)" '导出的内嵌 dshctl 带上新版本（manifest 版本字段来源）'
+if DSH_SERVICE_ROOT="$VER_ROOT" bash "$VER_ROOT/scripts/bump-version.sh" --check >/dev/null 2>&1; then
+	ok 'bump 后自检通过'
+else
+	bad 'bump 后自检应通过'
+fi
+
+# 回退被拒绝（需显式 --force）。
+if DSH_SERVICE_ROOT="$VER_ROOT" bash "$VER_ROOT/scripts/bump-version.sh" "$INSTALLER_VERSION" >/dev/null 2>&1; then
+	bad '更低的版本号应被拒绝'
+else
+	ok '更低的版本号被拒绝'
+fi
+
+# README 未同步时 --check 失败。
+sed -i 's|^当前版本：\*\*v[^ *]*\*\*|当前版本：**v9.9.9**|' "$VER_ROOT/README.md"
+if DSH_SERVICE_ROOT="$VER_ROOT" bash "$VER_ROOT/scripts/bump-version.sh" --check >/dev/null 2>&1; then
+	bad 'README 与 install.sh 不一致时 --check 应失败'
+else
+	ok 'README 与 install.sh 不一致时 --check 失败'
+fi
+assert_eq "$(installer_version_of "$ROOT/install.sh")" "$INSTALLER_VERSION" '真实仓库 install.sh 未被测试改动'
+
+# pre-commit 钩子：在临时仓库里验证自动递增与不一致时中断。
+if command -v git >/dev/null 2>&1; then
+	HOOK_REPO="$WORK/version-hook-repo"
+	rm -rf "$HOOK_REPO"
+	mkdir -p "$HOOK_REPO/scripts" "$HOOK_REPO/.githooks"
+	cp -p "$ROOT/install.sh" "$ROOT/README.md" "$HOOK_REPO/"
+	cp -p "$ROOT/scripts/bump-version.sh" "$HOOK_REPO/scripts/"
+	cp -p "$ROOT/.githooks/pre-commit" "$HOOK_REPO/.githooks/"
+	chmod +x "$HOOK_REPO/scripts/bump-version.sh" "$HOOK_REPO/.githooks/pre-commit"
+	git -C "$HOOK_REPO" init -q
+	git -C "$HOOK_REPO" config user.email test@example.com
+	git -C "$HOOK_REPO" config user.name dsh-service-test
+	git -C "$HOOK_REPO" add -A
+	git -C "$HOOK_REPO" commit -qm init
+
+	# 只改 README：钩子不碰版本号。
+	printf '\n<!-- probe -->\n' >> "$HOOK_REPO/README.md"
+	git -C "$HOOK_REPO" add README.md
+	HOOK_SKIP_RC=0
+	(cd "$HOOK_REPO" && "$HOOK_REPO/.githooks/pre-commit") >/dev/null 2>&1 || HOOK_SKIP_RC=$?
+	assert_eq "$HOOK_SKIP_RC" '0' '只改 README 时钩子跳过'
+	assert_eq "$(installer_version_of "$HOOK_REPO/install.sh")" "$INSTALLER_VERSION" '钩子未误改版本号'
+
+	# 改 install.sh 但不 bump：自动 patch 并暂存。
+	printf '\n# probe\n' >> "$HOOK_REPO/install.sh"
+	git -C "$HOOK_REPO" add install.sh
+	HOOK_BUMP_RC=0
+	(cd "$HOOK_REPO" && "$HOOK_REPO/.githooks/pre-commit") >/dev/null 2>&1 || HOOK_BUMP_RC=$?
+	assert_eq "$HOOK_BUMP_RC" '0' '钩子自动 bump 退出 0'
+	assert_eq "$(installer_version_of "$HOOK_REPO/install.sh")" "$NEXT_PATCH_VERSION" '钩子递增 patch'
+	git -C "$HOOK_REPO" show :install.sh > "$WORK/staged-install.sh" 2>/dev/null
+	assert_eq "$(installer_version_of "$WORK/staged-install.sh")" "$NEXT_PATCH_VERSION" '递增后的 install.sh 已入暂存区'
+	assert_eq "$(readme_version_of "$HOOK_REPO/README.md")" "$NEXT_PATCH_VERSION" '钩子同步 README 版本行'
+
+	# 只 bump 了 install.sh、README 未同步：中断提交。
+	git -C "$HOOK_REPO" reset -q
+	git -C "$HOOK_REPO" checkout -- install.sh README.md
+	printf '\n# probe2\n' >> "$HOOK_REPO/install.sh"
+	sed -i "s/^INSTALLER_VERSION=\".*\"$/INSTALLER_VERSION=\"$NEXT_PATCH_VERSION\"/" "$HOOK_REPO/install.sh"
+	git -C "$HOOK_REPO" add install.sh
+	HOOK_BAD_RC=0
+	(cd "$HOOK_REPO" && "$HOOK_REPO/.githooks/pre-commit") >/dev/null 2>&1 || HOOK_BAD_RC=$?
+	assert_eq "$HOOK_BAD_RC" '1' '版本号未同步时钩子中断提交'
+else
+	ok '跳过 Git 钩子测试（未安装 git）'
+fi
 
 # ── 汇总 ─────────────────────────────────────────────────────────────────────
 printf '\n通过 %d 项，失败 %d 项\n' "$PASS" "$FAIL"

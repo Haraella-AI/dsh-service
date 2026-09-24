@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  .githooks/pre-commit —— 改动 install.sh 时自动递增版本号
+#
+#  规则：install.sh 的 INSTALLER_VERSION / DSHCTL_VERSION 是同源同值的版本号，
+#  README 的版本行跟随显示。当本次提交改动了 install.sh 但没有动过版本号时，
+#  钩子调用 scripts/bump-version.sh patch 自动 +1 并暂存结果；已经手动 bump 过
+#  （暂存版本与 HEAD 不同）则只校验各处版本号是否一致。
+#
+#  启用：bash scripts/install-hooks.sh
+#  跳过：git commit --no-verify，或 DSH_SERVICE_SKIP_VERSION_BUMP=1 git commit ...
+# =============================================================================
+set -Eeuo pipefail
+
+if [ "${DSH_SERVICE_SKIP_VERSION_BUMP:-0}" = 1 ]; then
+	exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$ROOT" ]; then
+	exit 0
+fi
+cd -- "$ROOT"
+
+# 只看真正会带进提交的改动（新增/修改/改名）。
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qx 'install.sh'; then
+	exit 0
+fi
+
+BUMP="$ROOT/scripts/bump-version.sh"
+if [ ! -f "$BUMP" ]; then
+	printf '错误：install.sh 已改动但找不到 %s，无法维护版本号\n' "$BUMP" >&2
+	exit 1
+fi
+
+# 从任意 git 对象（HEAD:install.sh / :install.sh）读取 INSTALLER_VERSION。
+# 先把对象内容整体读进变量：awk 命中后即退出，直接管道会因 SIGPIPE + pipefail
+# 把「读到了版本号」误判成失败。
+version_of_blob() {
+	local content
+	content="$(git show "$1" 2>/dev/null)" || return 1
+	awk '
+		/^INSTALLER_VERSION="/ {
+			v = $0
+			sub(/^INSTALLER_VERSION="/, "", v)
+			sub(/"$/, "", v)
+			print v
+			exit
+		}
+	' <<<"$content"
+}
+
+HEAD_VER="$(version_of_blob HEAD:install.sh)" || HEAD_VER=''
+STAGED_VER="$(version_of_blob :install.sh)" || STAGED_VER=''
+
+if [ -z "$HEAD_VER" ]; then
+	# 首次提交或历史里没有版本号：交给人工决定，不阻塞提交。
+	printf '提示：HEAD 中读不到 INSTALLER_VERSION，跳过自动版本递增\n' >&2
+	exit 0
+fi
+if [ -z "$STAGED_VER" ]; then
+	printf '错误：暂存的 install.sh 中读不到 INSTALLER_VERSION\n' >&2
+	exit 1
+fi
+
+if [ "$STAGED_VER" = "$HEAD_VER" ]; then
+	# 自动改写会把整个文件重新入暂存区，因此工作区必须与暂存区一致，
+	# 否则可能把开发者尚未暂存的改动一并提交。
+	if ! git diff --quiet -- install.sh README.md; then
+		printf '错误：install.sh 有未暂存的改动，无法自动递增版本号。\n' >&2
+		printf '      请先 `git add install.sh README.md` 后重试，或手动 bump：\n' >&2
+		printf '        bash scripts/bump-version.sh patch\n' >&2
+		printf '      （跳过本钩子：git commit --no-verify）\n' >&2
+		exit 1
+	fi
+	printf 'install.sh 有改动但版本号未变，自动递增 patch：\n'
+	bash "$BUMP" patch --stage
+else
+	printf 'install.sh 版本号已手动更新为 v%s，校验一致性……\n' "$STAGED_VER"
+fi
+
+bash "$BUMP" --check >/dev/null
