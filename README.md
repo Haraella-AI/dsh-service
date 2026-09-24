@@ -60,6 +60,10 @@ cd dsh-service && bash install.sh
 
 安装脚本中的 dshctl 只有一份来源：它内嵌在 `install.sh` 里，可以用 `bash install.sh --print-dshctl` 导出比对。
 
+`install.sh` 的布局刻意保持「阅读顺序 == 执行顺序」：**常量区 → 内嵌 dshctl → 安装器函数定义 → 文件末尾的 `main "$@"`**。
+两段脚本不能互相 `source`，因此各自的常量区里有一份同名同值的 `DEFAULT_*`（以及镜像地址），改动一处时要同步另一处。
+注意：`bash < install.sh`（从标准输入执行）不受支持——内嵌 heredoc 会与脚本本身争夺 stdin；请用 `bash install.sh` 或 `curl -fsSL <url> | bash -s --`。
+
 ## 环境要求
 
 - 编译工具链不是必需项：dsh 及其依赖都使用预编译产物，安装器不会安装、也不再提供任何安装选项。如果将来某个依赖需要本地编译，请自行用发行版包管理器安装 `gcc`/`g++`/`make`（Debian 系 `sudo apt-get install -y build-essential`；AlmaLinux / RHEL / CentOS / Fedora 系 `sudo dnf install -y gcc gcc-c++ make`）。

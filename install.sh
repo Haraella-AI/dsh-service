@@ -15,12 +15,69 @@
 #    bash install.sh --help
 #
 #  说明：本脚本不处理 DEEPSEEK_API_KEY，模型密钥请在 Web 界面中配置。
+#
+#  文件布局（阅读顺序与执行顺序一致）：
+#    1. 常量区        不能被子配置/环境变量覆盖的内部常量与内置默认值
+#    2. 内嵌 dshctl   以 heredoc 内嵌的独立脚本，dshctl 的唯一来源；
+#                     它是一段自包含文本，不能引用主体里的任何常量
+#    3. 安装器主体    基础工具 → 参数解析 → 初始化 → 校验 → 各安装步骤 → 汇总，
+#                     顶层只有常量、内嵌块与函数定义
+#    4. main "$@"     文件最后一行的唯一入口调用（先定义后执行）
+#
+#  为什么内嵌块在中间而不是文件末尾：heredoc 的赋值是运行时行为，读取它的
+#  --print-dshctl 与安装步骤都必须在赋值之后；把内容留在末尾会让一个跨 2000 行的
+#  heredoc 头尾分离，更难维护。执行入口落在末尾同样达到「顶层无散装语句」的效果。
+#
+#  已知限制：`bash < install.sh`（从标准输入执行）会让 heredoc 内容与脚本本身
+#  争夺 stdin，不受支持；请用 `bash install.sh` 或 `curl -fsSL <url> | bash -s --`。
 # =============================================================================
 set -Eeuo pipefail
 LC_ALL=C
 export LC_ALL
 
 INSTALLER_VERSION="0.1.0"
+
+# =============================================================================
+#  常量区
+#
+#  判别标准：能被配置文件（~/.config/dsh-service/config）或环境变量覆盖的取值
+#  不是常量，留在下面的「默认值」块里用 : "${VAR:=...}" 处理；这里只放不能被
+#  覆盖的内部常量。DEFAULT_* 系列是那些配置键的内置默认值，集中在这里是为了
+#  让「脚本有哪些内置默认值」一目了然，并在用法文本与校验里复用同一处定义。
+#
+#  ⚠ 另一个 dshctl 是 heredoc 内嵌在本文件里的独立脚本（见下方 DSHCTL_EMBED_EOF），
+#    两段脚本不能互相 source，因此 dshctl 里有一份自己的常量区。两处的
+#    DEFAULT_* 必须保持一致，改一处就要同步另一处；这是刻意的重复，不要合并。
+# =============================================================================
+
+# ── 内置默认值（对应可被环境变量/配置文件覆盖的配置键） ──────────────────────
+# readonly 只防本脚本内部误改；用户的覆盖走 DSH_SERVICE_* 环境变量/配置文件，
+# 不写这些 DEFAULT_*。内嵌 dshctl 的常量区不能用 readonly（它在 source 配置之前），
+# 因此那边只是普通赋值，这里保持与本文件其它常量一致的 readonly。
+readonly DEFAULT_NAME='dsh'
+readonly DEFAULT_PROFILE='web'
+readonly DEFAULT_HOST='127.0.0.1'
+readonly DEFAULT_PORT=3080
+readonly DEFAULT_NODE_MAJOR=24
+readonly DEFAULT_NVM_VERSION='v0.40.1'
+readonly DEFAULT_DSH_CHANNEL='next'
+readonly DEFAULT_PNPM_VERSION='latest'
+
+# ── 镜像与上游地址 ───────────────────────────────────────────────────────────
+# 系统包管理器（apt/dnf/yum）的软件源不在本工具的管辖范围，绝不修改。
+readonly MIRROR_NPM_REGISTRY='https://registry.npmmirror.com'
+readonly MIRROR_NODE_MIRROR='https://npmmirror.com/mirrors/node'
+readonly OFFICIAL_NPM_REGISTRY='https://registry.npmjs.org'
+readonly MIRROR_NVM_REPO='https://gitee.com/mirrors/nvm'
+readonly OFFICIAL_NVM_REPO='https://github.com/nvm-sh/nvm'
+readonly MIRROR_NVM_INSTALL_URL_BASE='https://gitee.com/mirrors/nvm/raw'
+readonly OFFICIAL_NVM_INSTALL_URL_BASE='https://raw.githubusercontent.com/nvm-sh/nvm'
+
+# ── 行为参数 ─────────────────────────────────────────────────────────────────
+readonly NODE_ATTEMPTS_DEFAULT=3
+readonly NODE_RETRY_DELAY_DEFAULT=5
+# 安装完成后在摘要里等待登录链接的秒数（dshctl url --wait 的参数）。
+readonly DEFAULT_URL_WAIT_SEC=30
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  内嵌的 dshctl（唯一来源）。install.sh 会把它写到 <prefix>/dshctl；
@@ -37,6 +94,55 @@ IFS= read -r -d '' DSHCTL_SRC <<'DSHCTL_EMBED_EOF' || true
 set -Eeuo pipefail
 
 DSHCTL_VERSION="0.1.0"
+
+# =============================================================================
+#  常量区
+#
+#  判别标准：能被配置文件（~/.config/dsh-service/config）或环境变量覆盖的取值
+#  不是常量，留在下面的「配置」块里用 : "${VAR:=...}" 处理；这里只放不能被
+#  覆盖的内部常量。
+#
+#  ⚠ 另一个 dshctl 是 install.sh 的 heredoc 内嵌段（本文件的唯一来源）。工具
+#    两段脚本不能互相 source，因此 install.sh 主体里有一份自己的常量区。两处的
+#    DEFAULT_* 必须保持一致，改一处就要同步另一处；这是刻意的重复，不要合并。
+#
+#  注意：这里不用 readonly。dshctl 的常量区位于配置加载之前，而配置文件是被
+#  source 进来的；用 readonly 会让「配置文件里写了同名键」变成硬错误。
+# =============================================================================
+
+# ── 内置默认值（与 install.sh 主体常量区保持一致） ───────────────────────────
+DEFAULT_NAME='dsh'
+DEFAULT_PROFILE='web'
+DEFAULT_HOST='127.0.0.1'
+DEFAULT_PORT=3080
+DEFAULT_NODE_MAJOR=24
+DEFAULT_NVM_VERSION='v0.40.1'
+DEFAULT_DSH_CHANNEL='next'
+DEFAULT_PNPM_VERSION='latest'
+
+# ── 镜像与上游地址（与 install.sh 主体常量区保持一致） ───────────────────────
+MIRROR_NPM_REGISTRY='https://registry.npmmirror.com'
+MIRROR_NODE_MIRROR='https://npmmirror.com/mirrors/node'
+OFFICIAL_NPM_REGISTRY='https://registry.npmjs.org'
+MIRROR_NVM_REPO='https://gitee.com/mirrors/nvm'
+OFFICIAL_NVM_REPO='https://github.com/nvm-sh/nvm'
+
+# ── 归档格式 ─────────────────────────────────────────────────────────────────
+# export 写出的 manifest 格式版本；import 只接受同一版本。
+EXPORT_FORMAT=1
+
+# ── systemd 单元策略 ─────────────────────────────────────────────────────────
+# 由 render_unit 渲染进单元文件；改这些值会改变单元内容。
+UNIT_START_LIMIT_INTERVAL_SEC=300
+UNIT_START_LIMIT_BURST=5
+UNIT_RESTART_SEC=3
+UNIT_STOP_TIMEOUT_SEC=45
+
+# ── 行为参数 ─────────────────────────────────────────────────────────────────
+# wait_active：等待服务进入 active 的宽限秒数与轮询次数/间隔。
+UNIT_ACTIVE_GRACE_SEC=2
+UNIT_ACTIVE_POLLS=10
+UNIT_ACTIVE_POLL_INTERVAL_SEC=1
 
 # USER 并非在所有环境都存在（cron / 精简容器 / 部分 systemd 会话）；set -u 下直接
 # 引用 $USER 会让脚本以 “USER: unbound variable” 崩溃。
@@ -77,10 +183,10 @@ if [ -r "$CONFIG_FILE" ]; then
 fi
 
 # := 语义：环境变量优先于配置文件，配置文件优先于内置默认值。
-: "${DSH_SERVICE_NAME:=dsh}"
-: "${DSH_SERVICE_PROFILE:=web}"
-: "${DSH_SERVICE_HOST:=127.0.0.1}"
-: "${DSH_SERVICE_PORT:=3080}"
+: "${DSH_SERVICE_NAME:=$DEFAULT_NAME}"
+: "${DSH_SERVICE_PROFILE:=$DEFAULT_PROFILE}"
+: "${DSH_SERVICE_HOST:=$DEFAULT_HOST}"
+: "${DSH_SERVICE_PORT:=$DEFAULT_PORT}"
 : "${DSH_SERVICE_DSH_HOME:=$HOME/.dsh}"
 : "${DSH_SERVICE_NVM_DIR:=$HOME/.nvm}"
 : "${DSH_SERVICE_NODE_BIN_DIR:=}"
@@ -91,11 +197,11 @@ fi
 # npmmirror）。系统包管理器（apt/dnf/yum）的软件源不在本工具的管辖范围，绝不修改。
 : "${DSH_SERVICE_MIRROR:=1}"
 if [ "$DSH_SERVICE_MIRROR" = 0 ]; then
-	: "${DSH_SERVICE_NPM_REGISTRY:=https://registry.npmjs.org}"
+	: "${DSH_SERVICE_NPM_REGISTRY:=$OFFICIAL_NPM_REGISTRY}"
 	: "${DSH_SERVICE_NODE_MIRROR:=}"
 else
-	: "${DSH_SERVICE_NPM_REGISTRY:=https://registry.npmmirror.com}"
-	: "${DSH_SERVICE_NODE_MIRROR:=https://npmmirror.com/mirrors/node}"
+	: "${DSH_SERVICE_NPM_REGISTRY:=$MIRROR_NPM_REGISTRY}"
+	: "${DSH_SERVICE_NODE_MIRROR:=$MIRROR_NODE_MIRROR}"
 fi
 
 # 端口校验（环境变量 / 配置文件都可能给出非法值）。
@@ -114,11 +220,6 @@ DSH_SERVICE_PORT="$((10#$DSH_SERVICE_PORT))"
 DSH_SERVICE_UNIT_NAME="$DSH_SERVICE_NAME.service"
 DSH_SERVICE_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$DSH_SERVICE_UNIT_NAME"
 DSH_SERVICE_DSH_BIN="$DSH_SERVICE_LOCAL_BIN/dsh"
-
-# dsh 的默认通道：上游把「最新可用构建」放在 npm dist-tag next 上（latest 常常落后），
-# 因此省略目标时统一跟随 next；用 `dshctl upgrade latest` 或具体版本可显式覆盖。
-# 与 install.sh 安装器主体的 DSH_DEFAULT_CHANNEL 保持一致（两段脚本不能互相 source）。
-DSH_DEFAULT_CHANNEL='next'
 
 if [ -t 1 ]; then
 	C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_RESET=$'\033[0m'
@@ -509,16 +610,16 @@ render_unit() {
 		printf '%s\n' 'Documentation=https://github.com/deepseek-ai/deepseek-harness'
 		printf '%s\n' 'Wants=network-online.target'
 		printf '%s\n' 'After=network-online.target'
-		printf '%s\n' 'StartLimitIntervalSec=300'
-		printf '%s\n' 'StartLimitBurst=5'
+		printf '%s\n' "StartLimitIntervalSec=$UNIT_START_LIMIT_INTERVAL_SEC"
+		printf '%s\n' "StartLimitBurst=$UNIT_START_LIMIT_BURST"
 		printf '\n%s\n' '[Service]'
 		printf '%s\n' 'Type=exec'
 		printf 'Environment="PATH=%s"\n' "$(unit_dq "$path_value")"
 		printf 'Environment="DSH_HOME=%s"\n' "$(unit_dq "$DSH_SERVICE_DSH_HOME")"
 		printf 'ExecStart=%s %s\n' "$(unit_percent "$DSH_SERVICE_DSH_BIN")" "$(unit_percent "$exec_args")"
 		printf '%s\n' 'Restart=on-failure'
-		printf '%s\n' 'RestartSec=3'
-		printf '%s\n' 'TimeoutStopSec=45'
+		printf '%s\n' "RestartSec=$UNIT_RESTART_SEC"
+		printf '%s\n' "TimeoutStopSec=$UNIT_STOP_TIMEOUT_SEC"
 		printf '%s\n' 'StandardOutput=journal'
 		printf '%s\n' 'StandardError=journal'
 		printf 'SyslogIdentifier=%s\n' "$DSH_SERVICE_NAME"
@@ -592,9 +693,9 @@ reload_and_restart() {
 
 # 等待服务进入 active；宽限 $1 秒后仍非 active 视为启动失败（可捕捉启动即崩溃）。
 wait_active() {
-	local grace="${1:-2}" state i=0
+	local grace="${1:-$UNIT_ACTIVE_GRACE_SEC}" state i=0
 	sleep "$grace"
-	while [ "$i" -lt 10 ]; do
+	while [ "$i" -lt "$UNIT_ACTIVE_POLLS" ]; do
 		state="$(systemctl_user is-active "$DSH_SERVICE_UNIT_NAME" 2>/dev/null || true)"
 		case "$state" in
 			active) return 0 ;;
@@ -602,7 +703,7 @@ wait_active() {
 			*) return 1 ;;
 		esac
 		i=$((i + 1))
-		sleep 1
+		sleep "$UNIT_ACTIVE_POLL_INTERVAL_SEC"
 	done
 	return 1
 }
@@ -878,8 +979,218 @@ cmd_config() {
 }
 
 # ── 自检 ─────────────────────────────────────────────────────────────────────
+# ── doctor 分步实现 ──────────────────────────────────────────────────────────
+# 每个 doctor_check_* 只负责「判断 + 输出一行消息」，返回：
+#   0 = 通过（pass）  1 = 失败（fail）  2 = 提示（note）
+# 计数与配色统一由 doctor_report 处理，检查函数不直接调用 pass/fail/note，
+# 因此不需要写调用者的局部变量。
+
+doctor_check_nvm() {
+	if [ -s "$DSH_SERVICE_NVM_DIR/nvm.sh" ]; then
+		printf 'nvm: %s/nvm.sh\n' "$DSH_SERVICE_NVM_DIR"
+		return 0
+	fi
+	printf 'nvm 缺失: %s/nvm.sh（请运行 install.sh）\n' "$DSH_SERVICE_NVM_DIR"
+	return 1
+}
+
+doctor_check_node() {
+	local major
+	ensure_node_env
+	if ! command -v node >/dev/null 2>&1; then
+		printf '未找到 node（请运行 install.sh）\n'
+		return 1
+	fi
+	major="$(node_major)"
+	if [ -n "$major" ] && [ "$major" -ge 22 ]; then
+		printf 'node: %s（%s）\n' "$(node --version)" "$DSH_SERVICE_NODE_BIN_DIR"
+		return 0
+	fi
+	printf 'node 版本过低: %s（需要 v22 及以上）\n' "$(node --version)"
+	return 1
+}
+
+doctor_check_dsh() {
+	if command -v dsh >/dev/null 2>&1 || [ -x "$DSH_SERVICE_DSH_BIN" ]; then
+		printf 'dsh: %s（%s）\n' "$(installed_dsh_version || printf '版本未知')" "$(dsh_bin)"
+		return 0
+	fi
+	printf '未找到 dsh（请 npm install -g @deepseek-ai/dsh）\n'
+	return 1
+}
+
+doctor_check_frontend() {
+	local dist
+	dist="$(frontend_dist || true)"
+	if [ -n "$dist" ]; then
+		printf '前端资源: %s\n' "$dist"
+		return 0
+	fi
+	printf '未找到 @deepseek-ai/dsh-web-frontend 的 dist/index.html（Web 界面无法渲染）\n'
+	return 1
+}
+
+doctor_check_dsh_config() {
+	# 只在 dsh 存在时才检查（与重构前一致：dsh 缺失由 doctor_check_dsh 报告）。
+	if ! command -v dsh >/dev/null 2>&1 && [ ! -x "$DSH_SERVICE_DSH_BIN" ]; then
+		return 2
+	fi
+	if run_dsh web --dump-config >/dev/null 2>&1; then
+		printf '配置组合检查: dsh web --dump-config\n'
+		return 0
+	fi
+	printf 'dsh web --dump-config 失败（profile 或依赖有问题，试 dshctl logs）\n'
+	return 1
+}
+
+doctor_check_systemd() {
+	if have_user_systemd; then
+		printf '用户级 systemd 可用\n'
+		return 0
+	fi
+	printf '无法连接用户级 systemd\n'
+	systemd_hint
+	return 1
+}
+
+doctor_check_unit() {
+	if [ ! -f "$DSH_SERVICE_UNIT" ]; then
+		printf '单元文件不存在: %s（请运行 install.sh）\n' "$DSH_SERVICE_UNIT"
+		return 1
+	fi
+	printf '单元文件: %s\n' "$DSH_SERVICE_UNIT"
+	if systemctl_user is-enabled "$DSH_SERVICE_UNIT_NAME" >/dev/null 2>&1; then
+		printf '已设置开机自启\n'
+		return 0
+	fi
+	printf '未设置开机自启（dshctl enable）\n'
+	return 1
+}
+
+doctor_check_service_active() {
+	# 单元文件不存在时由 doctor_check_unit 报告，这里不再重复。
+	[ -f "$DSH_SERVICE_UNIT" ] || return 2
+	if [ "$(systemctl_user is-active "$DSH_SERVICE_UNIT_NAME" 2>/dev/null || true)" = active ]; then
+		printf '服务运行中\n'
+		return 0
+	fi
+	printf '服务未运行（dshctl start，或 dshctl logs 排查）\n'
+	return 1
+}
+
+doctor_check_linger() {
+	local linger
+	linger="$(loginctl show-user "$USER" -p Linger 2>/dev/null | sed -n 's/^Linger=//p' || true)"
+	if [ "$linger" = yes ]; then
+		printf 'linger 已启用（开机自启）\n'
+		return 0
+	fi
+	printf '未启用 linger（sudo loginctl enable-linger %s）\n' "$USER"
+	return 1
+}
+
+doctor_check_listener() {
+	local listener
+	listener="$(port_listener || true)"
+	if [ -n "$listener" ]; then
+		printf '端口 %s 正在监听: %s\n' "$DSH_SERVICE_PORT" "$listener"
+		return 0
+	fi
+	printf '端口 %s 未监听\n' "$DSH_SERVICE_PORT"
+	return 1
+}
+
+doctor_check_journal() {
+	if journal_user_works; then
+		printf '用户 journal 可读（dshctl logs / dshctl url 可用）\n'
+		return 0
+	fi
+	if command -v sudo >/dev/null 2>&1 && sudo_journal -n 0 >/dev/null 2>&1; then
+		printf '用户 journal 不可读，但可用免密 sudo 回退读取（dshctl logs / url 会自动回退）\n'
+		return 2
+	fi
+	printf '无法读取服务日志（修复: sudo usermod -aG systemd-journal %s 后重新登录）\n' "$USER"
+	return 1
+}
+
+doctor_check_path() {
+	case ":$PATH:" in
+		*":$DSH_SERVICE_LOCAL_BIN:"*)
+			printf '%s 已在 PATH 中\n' "$DSH_SERVICE_LOCAL_BIN"
+			return 0
+			;;
+	esac
+	printf '%s 不在 PATH 中（重新登录或 bash install.sh）\n' "$DSH_SERVICE_LOCAL_BIN"
+	return 1
+}
+
+doctor_check_symlink() {
+	if [ -L "$DSH_SERVICE_DSH_BIN" ] && [ -x "$DSH_SERVICE_DSH_BIN" ]; then
+		printf '稳定入口: %s -> %s\n' "$DSH_SERVICE_DSH_BIN" "$(readlink -f -- "$DSH_SERVICE_DSH_BIN")"
+		return 0
+	fi
+	printf '稳定入口缺失或失效: %s\n' "$DSH_SERVICE_DSH_BIN"
+	return 1
+}
+
+doctor_check_dsh_home() {
+	case "$DSH_SERVICE_DSH_HOME/" in
+		/mnt/*)
+			printf 'DSH_HOME 位于 /mnt（WSL drvfs 的符号链接不可靠，建议放在 Linux 原生路径）: %s\n' "$DSH_SERVICE_DSH_HOME"
+			return 2
+			;;
+	esac
+	printf 'DSH_HOME: %s\n' "$DSH_SERVICE_DSH_HOME"
+	return 0
+}
+
+# doctor_report：逐个运行检查项，按返回码统一输出并计数。
+# 设置：DOCTOR_OK、DOCTOR_BAD。
+doctor_report() {
+	local -a checks=(
+		doctor_check_nvm
+		doctor_check_node
+		doctor_check_dsh
+		doctor_check_frontend
+		doctor_check_dsh_config
+		doctor_check_systemd
+		doctor_check_unit
+		doctor_check_service_active
+		doctor_check_linger
+		doctor_check_listener
+		doctor_check_journal
+		doctor_check_path
+		doctor_check_symlink
+		doctor_check_dsh_home
+	)
+	local name rc msg
+	DOCTOR_OK=0
+	DOCTOR_BAD=0
+	for name in "${checks[@]}"; do
+		# 每个检查项只运行一次：先捕获输出与返回码，再决定用哪种前缀打印。
+		rc=0
+		msg="$("$name")" || rc=$?
+		case "$rc" in
+			0)
+				printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$msg"
+				DOCTOR_OK=$((DOCTOR_OK + 1))
+				;;
+			2)
+				printf '  %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$msg"
+				;;
+			*)
+				printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$msg"
+				DOCTOR_BAD=$((DOCTOR_BAD + 1))
+				;;
+		esac
+	done
+}
+
+# cmd_doctor：环境自检编排——解析 --fix → 逐项检查 → 汇总 → 可选修复。
 cmd_doctor() {
 	local fix=0
+	DOCTOR_OK=0
+	DOCTOR_BAD=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--fix) fix=1; shift ;;
@@ -887,115 +1198,8 @@ cmd_doctor() {
 		esac
 	done
 
-	local ok=0 bad=0 major
-	pass() { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; ok=$((ok + 1)); }
-	fail() { printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$*"; bad=$((bad + 1)); }
-	note() { printf '  %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
-
 	printf 'dshctl doctor —— 环境自检\n'
-
-	if [ -s "$DSH_SERVICE_NVM_DIR/nvm.sh" ]; then
-		pass "nvm: $DSH_SERVICE_NVM_DIR/nvm.sh"
-	else
-		fail "nvm 缺失: $DSH_SERVICE_NVM_DIR/nvm.sh（请运行 install.sh）"
-	fi
-
-	ensure_node_env
-	if command -v node >/dev/null 2>&1; then
-		major="$(node_major)"
-		if [ -n "$major" ] && [ "$major" -ge 22 ]; then
-			pass "node: $(node --version)（$DSH_SERVICE_NODE_BIN_DIR）"
-		else
-			fail "node 版本过低: $(node --version)（需要 v22 及以上）"
-		fi
-	else
-		fail "未找到 node（请运行 install.sh）"
-	fi
-
-	if command -v dsh >/dev/null 2>&1 || [ -x "$DSH_SERVICE_DSH_BIN" ]; then
-		pass "dsh: $(installed_dsh_version || printf '版本未知')（$(dsh_bin)）"
-	else
-		fail "未找到 dsh（请 npm install -g @deepseek-ai/dsh）"
-	fi
-
-	local dist
-	dist="$(frontend_dist || true)"
-	if [ -n "$dist" ]; then
-		pass "前端资源: $dist"
-	else
-		fail "未找到 @deepseek-ai/dsh-web-frontend 的 dist/index.html（Web 界面无法渲染）"
-	fi
-
-	if command -v dsh >/dev/null 2>&1 || [ -x "$DSH_SERVICE_DSH_BIN" ]; then
-		if run_dsh web --dump-config >/dev/null 2>&1; then
-			pass "配置组合检查: dsh web --dump-config"
-		else
-			fail "dsh web --dump-config 失败（profile 或依赖有问题，试 dshctl logs）"
-		fi
-	fi
-
-	if have_user_systemd; then
-		pass "用户级 systemd 可用"
-	else
-		fail "无法连接用户级 systemd"
-		systemd_hint
-	fi
-
-	if [ -f "$DSH_SERVICE_UNIT" ]; then
-		pass "单元文件: $DSH_SERVICE_UNIT"
-		if systemctl_user is-enabled "$DSH_SERVICE_UNIT_NAME" >/dev/null 2>&1; then
-			pass "已设置开机自启"
-		else
-			fail "未设置开机自启（dshctl enable）"
-		fi
-		if [ "$(systemctl_user is-active "$DSH_SERVICE_UNIT_NAME" 2>/dev/null || true)" = active ]; then
-			pass "服务运行中"
-		else
-			fail "服务未运行（dshctl start，或 dshctl logs 排查）"
-		fi
-	else
-		fail "单元文件不存在: $DSH_SERVICE_UNIT（请运行 install.sh）"
-	fi
-
-	local linger
-	linger="$(loginctl show-user "$USER" -p Linger 2>/dev/null | sed -n 's/^Linger=//p' || true)"
-	if [ "$linger" = yes ]; then
-		pass "linger 已启用（开机自启）"
-	else
-		fail "未启用 linger（sudo loginctl enable-linger $USER）"
-	fi
-
-	local listener
-	listener="$(port_listener || true)"
-	if [ -n "$listener" ]; then
-		pass "端口 $DSH_SERVICE_PORT 正在监听: $listener"
-	else
-		fail "端口 $DSH_SERVICE_PORT 未监听"
-	fi
-
-	if journal_user_works; then
-		pass "用户 journal 可读（dshctl logs / dshctl url 可用）"
-	elif command -v sudo >/dev/null 2>&1 && sudo_journal -n 0 >/dev/null 2>&1; then
-		note "用户 journal 不可读，但可用免密 sudo 回退读取（dshctl logs / url 会自动回退）"
-	else
-		fail "无法读取服务日志（修复: sudo usermod -aG systemd-journal $USER 后重新登录）"
-	fi
-
-	case ":$PATH:" in
-		*":$DSH_SERVICE_LOCAL_BIN:"*) pass "$DSH_SERVICE_LOCAL_BIN 已在 PATH 中" ;;
-		*) fail "$DSH_SERVICE_LOCAL_BIN 不在 PATH 中（重新登录或 bash install.sh）" ;;
-	esac
-
-	if [ -L "$DSH_SERVICE_DSH_BIN" ] && [ -x "$DSH_SERVICE_DSH_BIN" ]; then
-		pass "稳定入口: $DSH_SERVICE_DSH_BIN -> $(readlink -f -- "$DSH_SERVICE_DSH_BIN")"
-	else
-		fail "稳定入口缺失或失效: $DSH_SERVICE_DSH_BIN"
-	fi
-
-	case "$DSH_SERVICE_DSH_HOME/" in
-		/mnt/*) note "DSH_HOME 位于 /mnt（WSL drvfs 的符号链接不可靠，建议放在 Linux 原生路径）: $DSH_SERVICE_DSH_HOME" ;;
-		*) pass "DSH_HOME: $DSH_SERVICE_DSH_HOME" ;;
-	esac
+	doctor_report
 
 	if [ "$fix" = 1 ]; then
 		printf '\n开始修复：\n'
@@ -1006,8 +1210,8 @@ cmd_doctor() {
 		fi
 	fi
 
-	printf '\n通过 %d 项，失败 %d 项。\n' "$ok" "$bad"
-	if [ "$bad" -gt 0 ]; then
+	printf '\n通过 %d 项，失败 %d 项。\n' "$DOCTOR_OK" "$DOCTOR_BAD"
+	if [ "$DOCTOR_BAD" -gt 0 ]; then
 		return 1
 	fi
 	return 0
@@ -1036,7 +1240,7 @@ resolve_dist_tag() {
 resolve_target() {
 	local spec="${1:-}" resolved
 	if [ -z "$spec" ]; then
-		spec="$DSH_DEFAULT_CHANNEL"
+		spec="$DEFAULT_DSH_CHANNEL"
 	fi
 	# 具体版本号不查网络；dist-tag 需要查询 registry 解析成具体版本。
 	case "$spec" in
@@ -1075,7 +1279,7 @@ rollback_upgrade() {
 # 解析默认通道（next）当前指向的版本（查询失败时输出空）。
 upgrade_channel_version() {
 	local v
-	v="$(resolve_dist_tag "$DSH_DEFAULT_CHANNEL" || true)"
+	v="$(resolve_dist_tag "$DEFAULT_DSH_CHANNEL" || true)"
 	strip_v_prefix "$(normalize_version "$v")"
 }
 
@@ -1091,7 +1295,7 @@ upgrade_target_not_found_hint() {
 	err "版本 $target 在 registry 上不存在（没有该版本或 dist-tag）。"
 	channel="$(upgrade_channel_version)"
 	if [ -n "$channel" ]; then
-		printf '  默认通道 %s 当前版本: %s\n' "$DSH_DEFAULT_CHANNEL" "$channel" >&2
+		printf '  默认通道 %s 当前版本: %s\n' "$DEFAULT_DSH_CHANNEL" "$channel" >&2
 	fi
 	printf '  查看可用版本: dshctl upgrade --list\n' >&2
 	printf '  安装默认通道版本: dshctl upgrade\n' >&2
@@ -1180,8 +1384,49 @@ upgrade_validate_target() {
 	return 0
 }
 
+# install_upgraded_dsh：执行全局 npm 安装，把输出同时落一份到临时文件。
+# 若 npm 以「无匹配版本」失败，据此给出与装前校验一致的提示（覆盖校验与安装之间
+# 包被下架的竞态）。tee 保持流式输出。安装失败时服务不做任何改动。
+install_upgraded_dsh() {
+	local target="$1" before="$2" install_log='' install_rc=0
+	install_log="$(mktemp "${TMPDIR:-/tmp}/dshctl-upgrade.XXXXXX" 2>/dev/null || true)"
+	if [ -n "$install_log" ]; then
+		TMP_FILES+=("$install_log")
+		npm install -g "@deepseek-ai/dsh@$target" 2>&1 | tee "$install_log" || install_rc=$?
+	else
+		npm install -g "@deepseek-ai/dsh@$target" || install_rc=$?
+	fi
+	if [ "$install_rc" != 0 ]; then
+		err "npm 安装失败，服务未做任何改动（当前仍为 $before）"
+		if [ -n "$install_log" ] && grep -qE 'ETARGET|notarget|No matching version' "$install_log" 2>/dev/null; then
+			upgrade_target_not_found_hint "$target"
+		fi
+		return 1
+	fi
+	return 0
+}
+
+# verify_or_rollback：安装后校验版本并重启服务；任一环节失败都回滚到 before。
+verify_or_rollback() {
+	local target="$1" before="$2" no_restart="$3" after
+	after="$(installed_dsh_version 2>/dev/null || true)"
+	if [ "$after" != "$target" ]; then
+		warn "安装后版本校验失败（期望 $target，实际 ${after:-空}）"
+		rollback_upgrade "$before" "$no_restart" || true
+		return 1
+	fi
+
+	refresh_dsh_symlink || true
+	if ! reload_and_restart "$no_restart"; then
+		warn "服务重启失败，尝试回滚到 $before"
+		rollback_upgrade "$before" "$no_restart" || true
+		return 1
+	fi
+	return 0
+}
+
 cmd_upgrade() {
-	local spec="$DSH_DEFAULT_CHANNEL" spec_explicit=0 check=0 no_restart=0 list=0 list_limit=20
+	local spec="$DEFAULT_DSH_CHANNEL" spec_explicit=0 check=0 no_restart=0 list=0 list_limit=20
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--check) check=1; shift ;;
@@ -1224,7 +1469,7 @@ cmd_upgrade() {
 	load_nvm
 	apply_mirrors
 
-	local before after target
+	local before target
 	before="$(installed_dsh_version 2>/dev/null || true)"
 	if [ -z "$before" ]; then
 		die "未检测到已安装的 dsh，请先运行 install.sh"
@@ -1253,38 +1498,13 @@ cmd_upgrade() {
 	fi
 
 	log "升级 @deepseek-ai/dsh: $before -> $target"
-	# 安装输出同时落一份到临时文件：若 npm 以「无匹配版本」失败，据此给出与装前校验
-	# 一致的提示（覆盖校验与安装之间包被下架的竞态）。tee 保持流式输出。
-	local install_log='' install_rc=0
-	install_log="$(mktemp "${TMPDIR:-/tmp}/dshctl-upgrade.XXXXXX" 2>/dev/null || true)"
-	if [ -n "$install_log" ]; then
-		TMP_FILES+=("$install_log")
-		npm install -g "@deepseek-ai/dsh@$target" 2>&1 | tee "$install_log" || install_rc=$?
-	else
-		npm install -g "@deepseek-ai/dsh@$target" || install_rc=$?
-	fi
-	if [ "$install_rc" != 0 ]; then
-		err "npm 安装失败，服务未做任何改动（当前仍为 $before）"
-		if [ -n "$install_log" ] && grep -qE 'ETARGET|notarget|No matching version' "$install_log" 2>/dev/null; then
-			upgrade_target_not_found_hint "$target"
-		fi
+	if ! install_upgraded_dsh "$target" "$before"; then
 		return 1
 	fi
-
-	after="$(installed_dsh_version 2>/dev/null || true)"
-	if [ "$after" != "$target" ]; then
-		warn "安装后版本校验失败（期望 $target，实际 ${after:-空}）"
-		rollback_upgrade "$before" "$no_restart" || true
+	if ! verify_or_rollback "$target" "$before" "$no_restart"; then
 		return 1
 	fi
-
-	refresh_dsh_symlink || true
-	if ! reload_and_restart "$no_restart"; then
-		warn "服务重启失败，尝试回滚到 $before"
-		rollback_upgrade "$before" "$no_restart" || true
-		return 1
-	fi
-	log "升级完成: $before -> $after"
+	log "升级完成: $before -> $target"
 	return 0
 }
 
@@ -1315,9 +1535,9 @@ cmd_upgrade_node() {
 	fi
 	# 重装目标跟随默认通道（与 install.sh / dshctl upgrade 一致），而不是固定在换 Node
 	# 之前的旧版本。无法解析（registry 不可达）时中止，避免静默装成别的版本。
-	dsh_target="$(resolve_target "$DSH_DEFAULT_CHANNEL" || true)"
+	dsh_target="$(resolve_target "$DEFAULT_DSH_CHANNEL" || true)"
 	if [ -z "$dsh_target" ]; then
-		die "无法解析默认通道 $DSH_DEFAULT_CHANNEL 的目标版本（registry 不可用？），请检查网络后重试"
+		die "无法解析默认通道 $DEFAULT_DSH_CHANNEL 的目标版本（registry 不可用？），请检查网络后重试"
 	fi
 	# pnpm 与 dsh 一样装在「当前 Node 版本」的全局 npm 前缀下：换 Node 后旧版本
 	# 的 pnpm 不会自动出现，这里按升级前的版本重装（失败只告警，不阻断升级）。
@@ -1331,7 +1551,7 @@ cmd_upgrade_node() {
 	with_loose_shell nvm use --silent "$major" >/dev/null 2>&1 || true
 
 	new_bin="$(dirname -- "$(command -v node)")"
-	log "重装 @deepseek-ai/dsh@$dsh_target（默认通道 $DSH_DEFAULT_CHANNEL，当前 $dsh_ver）到 Node $major ..."
+	log "重装 @deepseek-ai/dsh@$dsh_target（默认通道 $DEFAULT_DSH_CHANNEL，当前 $dsh_ver）到 Node $major ..."
 	npm install -g "@deepseek-ai/dsh@$dsh_target" || die "重装 dsh 失败"
 
 	if [ -n "$pnpm_ver" ]; then
@@ -1489,6 +1709,43 @@ cmd_plugins_list() {
 	printf '%s\n' "$names" | sed 's/^/  - /'
 }
 
+# backup_plugins_manifest：把去掉全部插件依赖后的 manifest 写回，
+# 原文件备份为 package.json.bak。重写结果不是合法 JSON 时中止且不改动任何文件。
+backup_plugins_manifest() {
+	local manifest="$1" names="$2" names_file new_manifest
+	names_file="$(mktemp "$(dirname -- "$manifest")/.plugins.XXXXXX")"
+	TMP_FILES+=("$names_file")
+	new_manifest="$(mktemp "$(dirname -- "$manifest")/.package.json.XXXXXX")"
+	TMP_FILES+=("$new_manifest")
+	printf '%s\n' "$names" > "$names_file"
+	rewrite_profile_manifest "$names_file" "$manifest" > "$new_manifest"
+	if ! manifest_is_valid "$new_manifest"; then
+		rm -f -- "$new_manifest"
+		err "重写后的 profile manifest 不是合法 JSON，已中止（插件与配置均未改动）"
+		return 1
+	fi
+	cp -p -- "$manifest" "$manifest.bak"
+	chmod --reference="$manifest" "$new_manifest" 2>/dev/null || true
+	mv -f -- "$new_manifest" "$manifest"
+	log "已更新 profile manifest: $manifest（备份: $manifest.bak）"
+	return 0
+}
+
+# prune_installed_plugins：删除 profile 的 node_modules 与 pnpm-lock.yaml，
+# 使下次安装按新 manifest 重建。
+prune_installed_plugins() {
+	local dir="$1" modules="$dir/node_modules"
+	if [ -d "$modules" ]; then
+		rm -rf -- "$modules"
+		log "已移除插件目录: $modules"
+	fi
+	if [ -f "$dir/pnpm-lock.yaml" ]; then
+		rm -f -- "$dir/pnpm-lock.yaml"
+		log "已移除插件锁文件: $dir/pnpm-lock.yaml"
+	fi
+	return 0
+}
+
 cmd_plugins_reset() {
 	local assume_yes=0 no_restart=0
 	while [ $# -gt 0 ]; do
@@ -1529,18 +1786,7 @@ cmd_plugins_reset() {
 		fi
 	fi
 
-	local names_file new_manifest stopped=0
-	names_file="$(mktemp "$dir/.plugins.XXXXXX")"
-	TMP_FILES+=("$names_file")
-	new_manifest="$(mktemp "$dir/.package.json.XXXXXX")"
-	TMP_FILES+=("$new_manifest")
-	printf '%s\n' "$names" > "$names_file"
-	rewrite_profile_manifest "$names_file" "$manifest" > "$new_manifest"
-	if ! manifest_is_valid "$new_manifest"; then
-		rm -f -- "$new_manifest"
-		err "重写后的 profile manifest 不是合法 JSON，已中止（插件与配置均未改动）"
-		return 1
-	fi
+	local stopped=0
 
 	# 先停服务，避免边跑边删导致运行中的进程加载到已被删除的模块。
 	if [ "$no_restart" != 1 ] && have_user_systemd \
@@ -1550,20 +1796,8 @@ cmd_plugins_reset() {
 		log "已停止服务: $DSH_SERVICE_UNIT_NAME"
 	fi
 
-	cp -p -- "$manifest" "$manifest.bak"
-	chmod --reference="$manifest" "$new_manifest" 2>/dev/null || true
-	mv -f -- "$new_manifest" "$manifest"
-	log "已更新 profile manifest: $manifest（备份: $manifest.bak）"
-
-	local modules="$dir/node_modules"
-	if [ -d "$modules" ]; then
-		rm -rf -- "$modules"
-		log "已移除插件目录: $modules"
-	fi
-	if [ -f "$dir/pnpm-lock.yaml" ]; then
-		rm -f -- "$dir/pnpm-lock.yaml"
-		log "已移除插件锁文件: $dir/pnpm-lock.yaml"
-	fi
+	backup_plugins_manifest "$manifest" "$names" || return 1
+	prune_installed_plugins "$dir"
 
 	if [ "$no_restart" = 1 ]; then
 		warn "按 --no-restart 跳过服务重启；运行中的进程仍持有旧插件，稍后请执行: dshctl restart"
@@ -1601,7 +1835,7 @@ cmd_plugins() {
 #   manifest                    导出元数据与「可移植」的服务配置（纯 KEY=VALUE 文本）
 #   config/dsh-service.config   本机配置副本（仅供查看；导入只读 manifest，绝不 source）
 #   dsh-home/...                DSH_HOME 内容（node_modules 等可再生目录除外）
-EXPORT_FORMAT=1
+# manifest 的格式版本是常量区里的 EXPORT_FORMAT。
 
 # manifest / 摘要里的 0-1 开关
 inc_flag() {
@@ -1635,34 +1869,45 @@ node_modules 不会被导出。导入后在新环境执行以下命令重装插�
 EOF
 }
 
-cmd_export() {
-	local output='' with_secrets=0 with_sessions=1 with_attachments=1 force=0
+# ── export 分步实现 ──────────────────────────────────────────────────────────
+# export_* 用全局 EXPORT_* 传递中间结果（由前一步设置、后一步读取）。
+
+# export_parse_args：解析选项、生成默认文件名、把输出路径固化为绝对路径，
+# 并做「值含换行」的兜底校验。
+# 设置：EXPORT_OUTPUT、EXPORT_WITH_SECRETS、EXPORT_WITH_SESSIONS、
+#       EXPORT_WITH_ATTACHMENTS、EXPORT_FORCE、EXPORT_HOST。
+export_parse_args() {
+	local output='' v
+	EXPORT_WITH_SECRETS=0
+	EXPORT_WITH_SESSIONS=1
+	EXPORT_WITH_ATTACHMENTS=1
+	EXPORT_FORCE=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-o|--output) output="${2:?export: --output 需要一个文件路径}"; shift 2 ;;
 			--output=*) output="${1#*=}"; shift ;;
-			--with-secrets) with_secrets=1; shift ;;
-			--no-secrets) with_secrets=0; shift ;;
-			--with-sessions) with_sessions=1; shift ;;
-			--no-sessions) with_sessions=0; shift ;;
-			--with-attachments) with_attachments=1; shift ;;
-			--no-attachments) with_attachments=0; shift ;;
-			--force|-f) force=1; shift ;;
-			-h|--help) export_usage; return 0 ;;
+			--with-secrets) EXPORT_WITH_SECRETS=1; shift ;;
+			--no-secrets) EXPORT_WITH_SECRETS=0; shift ;;
+			--with-sessions) EXPORT_WITH_SESSIONS=1; shift ;;
+			--no-sessions) EXPORT_WITH_SESSIONS=0; shift ;;
+			--with-attachments) EXPORT_WITH_ATTACHMENTS=1; shift ;;
+			--no-attachments) EXPORT_WITH_ATTACHMENTS=0; shift ;;
+			--force|-f) EXPORT_FORCE=1; shift ;;
+			-h|--help) export_usage; EXPORT_OUTPUT=''; return 0 ;;
 			*) die "export: 未知参数 $1" ;;
 		esac
 	done
 
 	command -v tar >/dev/null 2>&1 || die "找不到 tar（导出需要 tar/gzip）"
 
-	local host stamp
-	host="$(uname -n 2>/dev/null || true)"
-	[ -n "$host" ] || host=unknown
-	host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '-')"
+	local stamp
+	EXPORT_HOST="$(uname -n 2>/dev/null || true)"
+	[ -n "$EXPORT_HOST" ] || EXPORT_HOST=unknown
+	EXPORT_HOST="$(printf '%s' "$EXPORT_HOST" | tr -c 'A-Za-z0-9._-' '-')"
 	stamp="$(date +%Y%m%d-%H%M%S 2>/dev/null || true)"
 	[ -n "$stamp" ] || stamp="$$"
 	if [ -z "$output" ]; then
-		output="dsh-service-export-${host}-${stamp}.tar.gz"
+		output="dsh-service-export-${EXPORT_HOST}-${stamp}.tar.gz"
 	fi
 	case "$output" in
 		*/) die "export: --output 需要文件路径，而不是目录: $output" ;;
@@ -1676,31 +1921,31 @@ cmd_export() {
 	if [ -d "$output" ]; then
 		die "export: 输出路径是一个目录: $output"
 	fi
-	if [ -e "$output" ] && [ "$force" != 1 ]; then
+	if [ -e "$output" ] && [ "$EXPORT_FORCE" != 1 ]; then
 		die "export: 文件已存在: $output（加 --force 覆盖）"
 	fi
 
 	# manifest 是逐行 KEY=VALUE，换行会破坏格式；配置值此前已校验，这里兜底。
-	local v
 	for v in "$DSH_SERVICE_NAME" "$DSH_SERVICE_PROFILE" "$DSH_SERVICE_HOST" \
-		"$DSH_SERVICE_PORT" "$DSH_SERVICE_DSH_HOME" "$DSH_SERVICE_EXTRA_ARGS" "$host"; do
+		"$DSH_SERVICE_PORT" "$DSH_SERVICE_DSH_HOME" "$DSH_SERVICE_EXTRA_ARGS" "$EXPORT_HOST"; do
 		case "$v" in
 			*$'\n'*|*$'\r'*) die "export: 值含换行，无法写入 manifest" ;;
 		esac
 	done
+	EXPORT_OUTPUT="$output"
+	return 0
+}
 
-	local stage
-	stage="$(mktemp -d "${TMPDIR:-/tmp}/dshctl-export.XXXXXX")" || die "export: 无法创建临时目录"
-	TMP_FILES+=("$stage")
-	mkdir -p -- "$stage/config" || die "export: 无法创建临时目录"
-
+# export_write_manifest：把元数据与可移植配置写成 manifest 到 staging 目录。
+export_write_manifest() {
+	local stage="$1"
 	{
 		printf '%s\n' '# dsh-service export manifest'
 		printf '%s\n' '# 纯 KEY=VALUE 文本；dshctl import 逐行读取，从不 source / eval 本文件。'
 		printf 'DSHCTL_EXPORT_FORMAT=%s\n' "$EXPORT_FORMAT"
 		printf 'DSHCTL_VERSION=%s\n' "$DSHCTL_VERSION"
 		printf 'EXPORTED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf unknown)"
-		printf 'EXPORTED_HOST=%s\n' "$host"
+		printf 'EXPORTED_HOST=%s\n' "$EXPORT_HOST"
 		printf 'DSH_VERSION=%s\n' "$(installed_dsh_version 2>/dev/null || true)"
 		printf 'SOURCE_DSH_HOME=%s\n' "$DSH_SERVICE_DSH_HOME"
 		printf 'SERVICE_NAME=%s\n' "$DSH_SERVICE_NAME"
@@ -1708,32 +1953,41 @@ cmd_export() {
 		printf 'SERVICE_HOST=%s\n' "$DSH_SERVICE_HOST"
 		printf 'SERVICE_PORT=%s\n' "$DSH_SERVICE_PORT"
 		printf 'SERVICE_EXTRA_ARGS=%s\n' "$DSH_SERVICE_EXTRA_ARGS"
-		printf 'INCLUDE_SESSIONS=%s\n' "$with_sessions"
-		printf 'INCLUDE_ATTACHMENTS=%s\n' "$with_attachments"
-		printf 'INCLUDE_SECRETS=%s\n' "$with_secrets"
+		printf 'INCLUDE_SESSIONS=%s\n' "$EXPORT_WITH_SESSIONS"
+		printf 'INCLUDE_ATTACHMENTS=%s\n' "$EXPORT_WITH_ATTACHMENTS"
+		printf 'INCLUDE_SECRETS=%s\n' "$EXPORT_WITH_SECRETS"
 	} > "$stage/manifest" || die "export: 写入 manifest 失败"
+	return 0
+}
 
-	local have_config=0
+# export_write_config_copy：把本机配置复制进归档（只读副本，导入时不 source）。
+export_write_config_copy() {
+	local stage="$1"
 	if [ -f "$CONFIG_FILE" ]; then
 		if ! cp -p -- "$CONFIG_FILE" "$stage/config/dsh-service.config"; then
 			die "export: 复制配置失败: $CONFIG_FILE"
 		fi
-		have_config=1
-	else
-		warn "配置文件不存在: $CONFIG_FILE（归档中不含配置副本）"
+		return 0
 	fi
+	warn "配置文件不存在: $CONFIG_FILE（归档中不含配置副本）"
+	return 0
+}
 
-	# tar 支持在成员列表中途 -C 切换目录；--transform 只影响以 "." 开头的成员
-	# （DSH_HOME 那一组），因此 manifest / config 保持原名，DSH_HOME 统一带前缀。
+# export_pack_archive：组装并执行 tar。tar 支持在成员列表中途 -C 切换目录；
+# --transform 只影响以 "." 开头的成员（DSH_HOME 那一组），因此 manifest / config
+# 保持原名，DSH_HOME 统一带 dsh-home/ 前缀。
+export_pack_archive() {
+	local stage="$1" output="$2" have_config="$3"
 	local -a tar_cmd=(tar -czf "$output")
+	local have_home=0 home_real out_real
 	tar_cmd+=(--exclude='*/node_modules' --exclude='*/.dsh-module-fallback' --exclude='*.lock')
-	if [ "$with_sessions" != 1 ]; then
+	if [ "$EXPORT_WITH_SESSIONS" != 1 ]; then
 		tar_cmd+=(--exclude='./sessions')
 	fi
-	if [ "$with_attachments" != 1 ]; then
+	if [ "$EXPORT_WITH_ATTACHMENTS" != 1 ]; then
 		tar_cmd+=(--exclude='./attachments')
 	fi
-	if [ "$with_secrets" != 1 ]; then
+	if [ "$EXPORT_WITH_SECRETS" != 1 ]; then
 		tar_cmd+=(--exclude='./.credentials.yaml')
 	fi
 	tar_cmd+=(-C "$stage" manifest)
@@ -1741,11 +1995,9 @@ cmd_export() {
 		tar_cmd+=(config)
 	fi
 
-	local have_home=0
 	if [ -d "$DSH_SERVICE_DSH_HOME" ]; then
 		have_home=1
 		# 输出文件若位于 DSH_HOME 内必须排除自身，否则 tar 会边写边读同一个文件。
-		local home_real out_real
 		home_real="$(readlink -f -- "$DSH_SERVICE_DSH_HOME" 2>/dev/null || printf '%s' "$DSH_SERVICE_DSH_HOME")"
 		out_real="$(readlink -f -- "$output" 2>/dev/null || printf '%s' "$output")"
 		case "$out_real" in
@@ -1760,7 +2012,13 @@ cmd_export() {
 		rm -f -- "$output"
 		die "export: 打包失败（tar 退出非 0）"
 	fi
-	local size
+	EXPORT_HAVE_HOME="$have_home"
+	return 0
+}
+
+# export_report：打印导出结果摘要（含大小与安全提示）。
+export_report() {
+	local output="$1" size
 	size="$(du -h -- "$output" 2>/dev/null | awk '{print $1}')"
 	# 某些文件系统（drvfs 等）对很小的文件返回 0，退回按字节数显示。
 	if [ -z "$size" ] || [ "$size" = 0 ]; then
@@ -1768,19 +2026,39 @@ cmd_export() {
 	fi
 
 	log "已导出: $output（${size:-大小未知}）"
-	printf '  来源      : %s@%s（dsh %s）\n' "$USER" "$host" "$(installed_dsh_version 2>/dev/null || printf '未检测到')"
+	printf '  来源      : %s@%s（dsh %s）\n' "$USER" "$EXPORT_HOST" "$(installed_dsh_version 2>/dev/null || printf '未检测到')"
 	printf '  服务配置  : profile=%s host=%s port=%s\n' "$DSH_SERVICE_PROFILE" "$DSH_SERVICE_HOST" "$DSH_SERVICE_PORT"
 	printf '  内容      : 会话=%s 附件=%s 凭证=%s DSH_HOME=%s\n' \
-		"$(inc_flag "$with_sessions")" "$(inc_flag "$with_attachments")" \
-		"$(inc_flag "$with_secrets")" "$(inc_flag "$have_home")"
-	if [ "$with_secrets" != 1 ]; then
+		"$(inc_flag "$EXPORT_WITH_SESSIONS")" "$(inc_flag "$EXPORT_WITH_ATTACHMENTS")" \
+		"$(inc_flag "$EXPORT_WITH_SECRETS")" "$(inc_flag "$EXPORT_HAVE_HOME")"
+	if [ "$EXPORT_WITH_SECRETS" != 1 ]; then
 		printf '  提示      : 默认不含凭证；需要一并迁移密钥时加 --with-secrets\n'
 	fi
 	printf '  导入      : dshctl import %s\n' "\"$output\""
-	if [ "$with_secrets" = 1 ]; then
+	if [ "$EXPORT_WITH_SECRETS" = 1 ]; then
 		chmod 0600 -- "$output" 2>/dev/null || true
 		warn "归档包含凭证（.credentials.yaml），请仅通过安全通道传输并妥善保管。"
 	fi
+	return 0
+}
+
+# cmd_export：导出编排——解析 → 写 manifest/配置副本 → 打包 → 报告。
+cmd_export() {
+	local stage have_config=0
+	export_parse_args "$@" || return $?
+	[ -n "$EXPORT_OUTPUT" ] || return 0
+
+	stage="$(mktemp -d "${TMPDIR:-/tmp}/dshctl-export.XXXXXX")" || die "export: 无法创建临时目录"
+	TMP_FILES+=("$stage")
+	mkdir -p -- "$stage/config" || die "export: 无法创建临时目录"
+
+	export_write_manifest "$stage"
+	if [ -f "$CONFIG_FILE" ]; then
+		have_config=1
+	fi
+	export_write_config_copy "$stage"
+	export_pack_archive "$stage" "$EXPORT_OUTPUT" "$have_config"
+	export_report "$EXPORT_OUTPUT"
 	return 0
 }
 
@@ -1804,16 +2082,28 @@ dshctl import —— 在新环境导入 dshctl export 生成的归档
 EOF
 }
 
-cmd_import() {
-	local archive='' assume_yes=0 no_restart=0 apply_config=1 install_plugins=0 dry_run=0 reply=''
+# ── import 分步实现 ──────────────────────────────────────────────────────────
+# import_* 各函数用全局 IMPORT_* / IMPORT_META_* 传递中间结果（由 parse/read 设置，
+# 由后续步骤读取）；这样每个函数只做一件可命名的事，编排留给 cmd_import。
+
+# import_parse_args：解析参数并把归档路径规范化写入 IMPORT_ARCHIVE_ABS。
+# 设置：IMPORT_ASSUME_YES、IMPORT_NO_RESTART、IMPORT_APPLY_CONFIG、
+#       IMPORT_INSTALL_PLUGINS、IMPORT_DRY_RUN、IMPORT_ARCHIVE_ABS。
+import_parse_args() {
+	local archive=''
+	IMPORT_ASSUME_YES=0
+	IMPORT_NO_RESTART=0
+	IMPORT_APPLY_CONFIG=1
+	IMPORT_INSTALL_PLUGINS=0
+	IMPORT_DRY_RUN=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
-			--yes|-y) assume_yes=1; shift ;;
-			--no-config) apply_config=0; shift ;;
-			--no-restart) no_restart=1; shift ;;
-			--install-plugins) install_plugins=1; shift ;;
-			--dry-run) dry_run=1; shift ;;
-			-h|--help) import_usage; return 0 ;;
+			--yes|-y) IMPORT_ASSUME_YES=1; shift ;;
+			--no-config) IMPORT_APPLY_CONFIG=0; shift ;;
+			--no-restart) IMPORT_NO_RESTART=1; shift ;;
+			--install-plugins) IMPORT_INSTALL_PLUGINS=1; shift ;;
+			--dry-run) IMPORT_DRY_RUN=1; shift ;;
+			-h|--help) import_usage; IMPORT_ARCHIVE_ABS=''; return 0 ;;
 			-*) die "import: 未知参数 $1" ;;
 			*)
 				if [ -n "$archive" ]; then
@@ -1831,39 +2121,36 @@ cmd_import() {
 		die "import: 找不到归档文件: $archive"
 	fi
 	command -v tar >/dev/null 2>&1 || die "找不到 tar（导入需要 tar/gzip）"
+	IMPORT_ARCHIVE_ABS="$(cd -- "$(dirname -- "$archive")" && pwd)/$(basename -- "$archive")"
+	return 0
+}
 
-	local archive_abs
-	archive_abs="$(cd -- "$(dirname -- "$archive")" && pwd)/$(basename -- "$archive")"
-
-	local stage
-	stage="$(mktemp -d "${TMPDIR:-/tmp}/dshctl-import.XXXXXX")" || die "import: 无法创建临时目录"
-	TMP_FILES+=("$stage")
-
-	# 先列出全部成员校验：只允许 manifest / config/ / dsh-home/ 三类顶层条目，
-	# 且任何位置都不得出现 ".."，避免畸形归档写到 staging 之外。
-	if ! tar -tzf "$archive_abs" > "$stage/.members" 2>/dev/null; then
-		die "import: 无法读取归档（不是有效的 tar.gz？）: $archive"
+# import_verify_members：校验归档成员名单——只允许 manifest / config/ / dsh-home/
+# 三类顶层条目，且任何位置都不得出现 ".."，避免畸形归档写到 staging 之外。
+import_verify_members() {
+	local archive_abs="$1" members="$2" member bad=''
+	if ! tar -tzf "$archive_abs" > "$members" 2>/dev/null; then
+		die "import: 无法读取归档（不是有效的 tar.gz？）: $archive_abs"
 	fi
-	local member bad=''
 	while IFS= read -r member; do
 		case "$member" in
 			''|manifest|manifest/|config|config/|dsh-home|dsh-home/) ;;
 			config/*|dsh-home/*) ;;
-			*)
-				bad="$member"
-				break
-				;;
+			*) bad="$member"; break ;;
 		esac
 		case "$member" in
-			../*|*/../*|..|*/..)
-				bad="$member"
-				break
-				;;
+			../*|*/../*|..|*/..) bad="$member"; break ;;
 		esac
-	done < "$stage/.members"
+	done < "$members"
 	if [ -n "$bad" ]; then
 		die "import: 归档含非法条目（可能不是 dshctl export 生成的）: $bad"
 	fi
+	return 0
+}
+
+# import_extract：把归档解压到 staging 目录并确认 manifest 存在。
+import_extract() {
+	local archive_abs="$1" stage="$2"
 	# --no-same-owner：即使以 root 运行也不让归档里的 uid/gid 生效。
 	if ! tar -xzf "$archive_abs" --no-same-owner -C "$stage"; then
 		die "import: 解压失败"
@@ -1871,11 +2158,27 @@ cmd_import() {
 	if [ ! -f "$stage/manifest" ]; then
 		die "import: 归档缺少 manifest（不是 dshctl export 生成的归档）"
 	fi
+	return 0
+}
 
-	local m_format='' m_version='' m_at='' m_host='' m_dsh='' m_src_home=''
-	local m_name='' m_profile='' m_svc_host='' m_port='' m_extra=''
-	local m_sessions='' m_attachments='' m_secrets=''
-	local line key val
+# import_read_manifest：逐行读取 manifest，校验格式/键名/格式版本，并把各字段
+# 写入 IMPORT_META_*（缺失的字段回退到本机取值，非法取值直接退出 1）。
+import_read_manifest() {
+	local manifest="$1" line key val
+	IMPORT_META_FORMAT=''
+	IMPORT_META_VERSION=''
+	IMPORT_META_AT=''
+	IMPORT_META_HOST=''
+	IMPORT_META_DSH=''
+	IMPORT_META_SRC_HOME=''
+	IMPORT_META_NAME=''
+	IMPORT_META_PROFILE=''
+	IMPORT_META_SVC_HOST=''
+	IMPORT_META_PORT=''
+	IMPORT_META_EXTRA=''
+	IMPORT_META_SESSIONS=''
+	IMPORT_META_ATTACHMENTS=''
+	IMPORT_META_SECRETS=''
 	while IFS= read -r line || [ -n "$line" ]; do
 		case "$line" in
 			''|'#'*) continue ;;
@@ -1890,93 +2193,162 @@ cmd_import() {
 			''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) die "import: manifest 键名非法: $key" ;;
 		esac
 		case "$key" in
-			DSHCTL_EXPORT_FORMAT) m_format="$val" ;;
-			DSHCTL_VERSION) m_version="$val" ;;
-			EXPORTED_AT) m_at="$val" ;;
-			EXPORTED_HOST) m_host="$val" ;;
-			DSH_VERSION) m_dsh="$val" ;;
-			SOURCE_DSH_HOME) m_src_home="$val" ;;
-			SERVICE_NAME) m_name="$val" ;;
-			SERVICE_PROFILE) m_profile="$val" ;;
-			SERVICE_HOST) m_svc_host="$val" ;;
-			SERVICE_PORT) m_port="$val" ;;
-			SERVICE_EXTRA_ARGS) m_extra="$val" ;;
-			INCLUDE_SESSIONS) m_sessions="$val" ;;
-			INCLUDE_ATTACHMENTS) m_attachments="$val" ;;
-			INCLUDE_SECRETS) m_secrets="$val" ;;
+			DSHCTL_EXPORT_FORMAT) IMPORT_META_FORMAT="$val" ;;
+			DSHCTL_VERSION) IMPORT_META_VERSION="$val" ;;
+			EXPORTED_AT) IMPORT_META_AT="$val" ;;
+			EXPORTED_HOST) IMPORT_META_HOST="$val" ;;
+			DSH_VERSION) IMPORT_META_DSH="$val" ;;
+			SOURCE_DSH_HOME) IMPORT_META_SRC_HOME="$val" ;;
+			SERVICE_NAME) IMPORT_META_NAME="$val" ;;
+			SERVICE_PROFILE) IMPORT_META_PROFILE="$val" ;;
+			SERVICE_HOST) IMPORT_META_SVC_HOST="$val" ;;
+			SERVICE_PORT) IMPORT_META_PORT="$val" ;;
+			SERVICE_EXTRA_ARGS) IMPORT_META_EXTRA="$val" ;;
+			INCLUDE_SESSIONS) IMPORT_META_SESSIONS="$val" ;;
+			INCLUDE_ATTACHMENTS) IMPORT_META_ATTACHMENTS="$val" ;;
+			INCLUDE_SECRETS) IMPORT_META_SECRETS="$val" ;;
 			*) warn "import: 忽略未知 manifest 项: $key" ;;
 		esac
-	done < "$stage/manifest"
+	done < "$manifest"
 
-	if [ "$m_format" != "$EXPORT_FORMAT" ]; then
-		die "import: 不支持的归档格式 ${m_format:-（空）}（本机 dshctl $DSHCTL_VERSION 支持格式 $EXPORT_FORMAT）"
+	if [ "$IMPORT_META_FORMAT" != "$EXPORT_FORMAT" ]; then
+		die "import: 不支持的归档格式 ${IMPORT_META_FORMAT:-（空）}（本机 dshctl $DSHCTL_VERSION 支持格式 $EXPORT_FORMAT）"
 	fi
 
-	if [ -z "$m_name" ]; then m_name="$DSH_SERVICE_NAME"; fi
-	case "$m_name" in
-		*[!A-Za-z0-9_.@-]*) die "import: 归档中的单元名非法: $m_name" ;;
+	if [ -z "$IMPORT_META_NAME" ]; then IMPORT_META_NAME="$DSH_SERVICE_NAME"; fi
+	case "$IMPORT_META_NAME" in
+		*[!A-Za-z0-9_.@-]*) die "import: 归档中的单元名非法: $IMPORT_META_NAME" ;;
 	esac
-	if [ -z "$m_profile" ]; then m_profile="$DSH_SERVICE_PROFILE"; fi
-	case "$m_profile" in
-		*[!A-Za-z0-9_.@-]*) die "import: 归档中的 profile 名非法: $m_profile" ;;
+	if [ -z "$IMPORT_META_PROFILE" ]; then IMPORT_META_PROFILE="$DSH_SERVICE_PROFILE"; fi
+	case "$IMPORT_META_PROFILE" in
+		*[!A-Za-z0-9_.@-]*) die "import: 归档中的 profile 名非法: $IMPORT_META_PROFILE" ;;
 	esac
-	if [ -z "$m_port" ]; then
-		m_port="$DSH_SERVICE_PORT"
+	if [ -z "$IMPORT_META_PORT" ]; then
+		IMPORT_META_PORT="$DSH_SERVICE_PORT"
 	fi
-	case "$m_port" in
-		*[!0-9]*) die "import: 归档中的端口非法: $m_port" ;;
+	case "$IMPORT_META_PORT" in
+		*[!0-9]*) die "import: 归档中的端口非法: $IMPORT_META_PORT" ;;
 	esac
-	if [ "${#m_port}" -gt 5 ] || [ "$((10#$m_port))" -lt 1 ] || [ "$((10#$m_port))" -gt 65535 ]; then
-		die "import: 归档中的端口超出范围: $m_port"
+	if [ "${#IMPORT_META_PORT}" -gt 5 ] || [ "$((10#$IMPORT_META_PORT))" -lt 1 ] || [ "$((10#$IMPORT_META_PORT))" -gt 65535 ]; then
+		die "import: 归档中的端口超出范围: $IMPORT_META_PORT"
 	fi
-	m_port="$((10#$m_port))"
-	if [ -z "$m_svc_host" ]; then m_svc_host="$DSH_SERVICE_HOST"; fi
+	IMPORT_META_PORT="$((10#$IMPORT_META_PORT))"
+	if [ -z "$IMPORT_META_SVC_HOST" ]; then IMPORT_META_SVC_HOST="$DSH_SERVICE_HOST"; fi
+	return 0
+}
 
-	local have_home=0
+# import_stage_home：把归档里的 dsh-home/ 合并进本机 DSH_HOME（覆盖项就地备份）。
+import_stage_home() {
+	local stage="$1"
+	if ! mkdir -p -- "$DSH_SERVICE_DSH_HOME"; then
+		die "import: 无法创建 DSH_HOME: $DSH_SERVICE_DSH_HOME"
+	fi
+	# 目录内容合并拷贝；被覆盖的文件以 <文件>.~N~ 就地备份，未在归档中的文件保留。
+	if ! cp -a --backup=numbered "$stage/dsh-home/." "$DSH_SERVICE_DSH_HOME/"; then
+		die "import: 写入 DSH_HOME 失败: $DSH_SERVICE_DSH_HOME"
+	fi
+	log "已导入 DSH_HOME: $DSH_SERVICE_DSH_HOME（被覆盖的文件备份为 <文件>.~N~）"
+	return 0
+}
+
+# import_apply_config：按需备份原配置，再只应用「可移植」的设置项并重新渲染。
+# 单元名、DSH_HOME、nvm / node bin / local bin 都保留本机取值：它们指向具体主机
+# 的路径，照搬归档里的值会让新环境无法启动。
+import_apply_config() {
+	local cfg_bak
+	if [ -f "$CONFIG_FILE" ]; then
+		cfg_bak="$CONFIG_FILE.bak-$(date +%Y%m%d%H%M%S 2>/dev/null || printf '%s' "$$")"
+		if cp -p -- "$CONFIG_FILE" "$cfg_bak"; then
+			log "已备份原配置: $cfg_bak"
+		else
+			warn "备份原配置失败: $CONFIG_FILE"
+		fi
+	fi
+	DSH_SERVICE_PROFILE="$IMPORT_META_PROFILE"
+	DSH_SERVICE_HOST="$IMPORT_META_SVC_HOST"
+	DSH_SERVICE_PORT="$IMPORT_META_PORT"
+	DSH_SERVICE_EXTRA_ARGS="$IMPORT_META_EXTRA"
+	render_config
+	return 0
+}
+
+# import_restore_plugins：profile 的插件依赖不在归档里（node_modules 被排除），
+# 需要时自动重装，否则提示用户手动执行。
+import_restore_plugins() {
+	local manifest deps count
+	manifest="$(dsh_profile_dir)/package.json"
+	[ -f "$manifest" ] || return 0
+	deps="$(list_plugin_deps "$manifest")"
+	[ -n "$deps" ] || return 0
+	count="$(printf '%s\n' "$deps" | grep -c . || true)"
+	if [ "$IMPORT_INSTALL_PLUGINS" = 1 ]; then
+		log "重装 profile \"$DSH_SERVICE_PROFILE\" 的插件（$count 个）..."
+		ensure_node_bin_path
+		if ! run_dsh plugin --profile "$DSH_SERVICE_PROFILE" install; then
+			warn "插件安装失败；请稍后手动执行: dsh plugin --profile $DSH_SERVICE_PROFILE install"
+		fi
+	else
+		warn "profile 含 $count 个插件依赖，但归档不含 node_modules。"
+		printf '  请稍后执行: dsh plugin --profile %s install\n' "$DSH_SERVICE_PROFILE" >&2
+		printf '  或重新导入并加 --install-plugins\n' >&2
+	fi
+	return 0
+}
+
+# cmd_import：导入编排——解析 → 校验成员 → 解压 → 读 manifest → 展示 → 落盘。
+cmd_import() {
+	local stage have_home=0 stopped=0 do_restart=1 reply=''
+	import_parse_args "$@" || return $?
+	# import_parse_args 打印过帮助时把归档路径留空，据此提前结束。
+	[ -n "$IMPORT_ARCHIVE_ABS" ] || return 0
+
+	stage="$(mktemp -d "${TMPDIR:-/tmp}/dshctl-import.XXXXXX")" || die "import: 无法创建临时目录"
+	TMP_FILES+=("$stage")
+
+	import_verify_members "$IMPORT_ARCHIVE_ABS" "$stage/.members"
+	import_extract "$IMPORT_ARCHIVE_ABS" "$stage"
+	import_read_manifest "$stage/manifest"
+
 	if [ -d "$stage/dsh-home" ]; then
 		have_home=1
 	fi
 
-	log "归档: $archive_abs"
-	printf '  格式      : %s（dshctl %s，导出时间 %s）\n' "$m_format" "${m_version:-未知}" "${m_at:-未知}"
-	printf '  来源      : %s（dsh %s）\n' "${m_host:-未知}" "${m_dsh:-未检测到}"
-	printf '  DSH_HOME  : %s\n' "${m_src_home:-未知}"
+	log "归档: $IMPORT_ARCHIVE_ABS"
+	printf '  格式      : %s（dshctl %s，导出时间 %s）\n' "$IMPORT_META_FORMAT" "${IMPORT_META_VERSION:-未知}" "${IMPORT_META_AT:-未知}"
+	printf '  来源      : %s（dsh %s）\n' "${IMPORT_META_HOST:-未知}" "${IMPORT_META_DSH:-未检测到}"
+	printf '  DSH_HOME  : %s\n' "${IMPORT_META_SRC_HOME:-未知}"
 	printf '              本机为 %s\n' "$DSH_SERVICE_DSH_HOME"
-	printf '  服务配置  : profile=%s host=%s port=%s\n' "$m_profile" "$m_svc_host" "$m_port"
+	printf '  服务配置  : profile=%s host=%s port=%s\n' "$IMPORT_META_PROFILE" "$IMPORT_META_SVC_HOST" "$IMPORT_META_PORT"
 	printf '  内容      : 会话=%s 附件=%s 凭证=%s\n' \
-		"$(inc_flag "$m_sessions")" "$(inc_flag "$m_attachments")" "$(inc_flag "$m_secrets")"
+		"$(inc_flag "$IMPORT_META_SESSIONS")" "$(inc_flag "$IMPORT_META_ATTACHMENTS")" "$(inc_flag "$IMPORT_META_SECRETS")"
 	if [ "$have_home" = 1 ]; then
 		printf '  条目      : %s\n' "$(find "$stage/dsh-home" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort | paste -sd ' ' -)"
 	fi
-	if [ "$m_secrets" = 1 ]; then
+	if [ "$IMPORT_META_SECRETS" = 1 ]; then
 		warn "归档包含凭证（.credentials.yaml），导入会覆盖本机凭证（原文件就地备份为 .~N~）。"
 	fi
-	if [ "$apply_config" = 1 ] && [ "$m_name" != "$DSH_SERVICE_NAME" ]; then
-		warn "归档中的单元名是 $m_name，与本机 $DSH_SERVICE_NAME 不同；保留本机单元名。"
+	if [ "$IMPORT_APPLY_CONFIG" = 1 ] && [ "$IMPORT_META_NAME" != "$DSH_SERVICE_NAME" ]; then
+		warn "归档中的单元名是 $IMPORT_META_NAME，与本机 $DSH_SERVICE_NAME 不同；保留本机单元名。"
 	fi
 
-	local do_restart=1
-	if [ "$no_restart" = 1 ]; then
+	if [ "$IMPORT_NO_RESTART" = 1 ]; then
 		do_restart=0
 	fi
-	if [ "$dry_run" = 1 ]; then
+	if [ "$IMPORT_DRY_RUN" = 1 ]; then
 		log "dry-run：未写入任何文件。"
 		printf '  将执行    : 服务配置=%s DSH_HOME=%s 插件安装=%s 服务重启=%s\n' \
-			"$(inc_flag "$apply_config")" "$(inc_flag "$have_home")" \
-			"$(inc_flag "$install_plugins")" "$(inc_flag "$do_restart")"
+			"$(inc_flag "$IMPORT_APPLY_CONFIG")" "$(inc_flag "$have_home")" \
+			"$(inc_flag "$IMPORT_INSTALL_PLUGINS")" "$(inc_flag "$do_restart")"
 		return 0
 	fi
 
-	if [ "$assume_yes" != 1 ]; then
+	if [ "$IMPORT_ASSUME_YES" != 1 ]; then
 		if [ -t 0 ]; then
 			printf '确认导入到 %s？[y/N] ' "$DSH_SERVICE_DSH_HOME"
 			read -r reply
 			case "$reply" in
 				y|Y|yes|YES) ;;
-				*)
-					log "已取消"
-					return 0
-					;;
+				*) log "已取消"; return 0 ;;
 			esac
 		else
 			die "import: 非交互式环境请加 --yes"
@@ -1984,66 +2356,22 @@ cmd_import() {
 	fi
 
 	# 边跑边换 profile / 会话容易读到半旧半新的状态，先停服务，最后统一重启。
-	local stopped=0
-	if [ "$no_restart" != 1 ] && have_user_systemd \
+	if [ "$IMPORT_NO_RESTART" != 1 ] && have_user_systemd \
 		&& [ "$(systemctl_user is-active "$DSH_SERVICE_UNIT_NAME" 2>/dev/null || true)" = active ]; then
 		systemctl_user stop "$DSH_SERVICE_UNIT_NAME" 2>/dev/null || true
 		stopped=1
 		log "已停止服务: $DSH_SERVICE_UNIT_NAME"
 	fi
 
-	if [ "$apply_config" = 1 ]; then
-		if [ -f "$CONFIG_FILE" ]; then
-			local cfg_bak
-			cfg_bak="$CONFIG_FILE.bak-$(date +%Y%m%d%H%M%S 2>/dev/null || printf '%s' "$$")"
-			if cp -p -- "$CONFIG_FILE" "$cfg_bak"; then
-				log "已备份原配置: $cfg_bak"
-			else
-				warn "备份原配置失败: $CONFIG_FILE"
-			fi
-		fi
-		DSH_SERVICE_PROFILE="$m_profile"
-		DSH_SERVICE_HOST="$m_svc_host"
-		DSH_SERVICE_PORT="$m_port"
-		DSH_SERVICE_EXTRA_ARGS="$m_extra"
-		# 单元名、DSH_HOME、nvm / node bin / local bin 都保留本机取值：它们指向
-		# 具体主机的路径，照搬归档里的值会让新环境无法启动。
-		render_config
+	if [ "$IMPORT_APPLY_CONFIG" = 1 ]; then
+		import_apply_config
 	fi
-
 	if [ "$have_home" = 1 ]; then
-		if ! mkdir -p -- "$DSH_SERVICE_DSH_HOME"; then
-			die "import: 无法创建 DSH_HOME: $DSH_SERVICE_DSH_HOME"
-		fi
-		# 目录内容合并拷贝；被覆盖的文件以 <文件>.~N~ 就地备份，未在归档中的文件保留。
-		if ! cp -a --backup=numbered "$stage/dsh-home/." "$DSH_SERVICE_DSH_HOME/"; then
-			die "import: 写入 DSH_HOME 失败: $DSH_SERVICE_DSH_HOME"
-		fi
-		log "已导入 DSH_HOME: $DSH_SERVICE_DSH_HOME（被覆盖的文件备份为 <文件>.~N~）"
+		import_stage_home "$stage"
 	fi
+	import_restore_plugins
 
-	# profile 的插件依赖不在归档里（node_modules 被排除），需要时可自动重装。
-	local manifest deps count
-	manifest="$(dsh_profile_dir)/package.json"
-	if [ -f "$manifest" ]; then
-		deps="$(list_plugin_deps "$manifest")"
-		if [ -n "$deps" ]; then
-			count="$(printf '%s\n' "$deps" | grep -c . || true)"
-			if [ "$install_plugins" = 1 ]; then
-				log "重装 profile \"$DSH_SERVICE_PROFILE\" 的插件（$count 个）..."
-				ensure_node_bin_path
-				if ! run_dsh plugin --profile "$DSH_SERVICE_PROFILE" install; then
-					warn "插件安装失败；请稍后手动执行: dsh plugin --profile $DSH_SERVICE_PROFILE install"
-				fi
-			else
-				warn "profile 含 $count 个插件依赖，但归档不含 node_modules。"
-				printf '  请稍后执行: dsh plugin --profile %s install\n' "$DSH_SERVICE_PROFILE" >&2
-				printf '  或重新导入并加 --install-plugins\n' >&2
-			fi
-		fi
-	fi
-
-	if [ "$no_restart" = 1 ]; then
+	if [ "$IMPORT_NO_RESTART" = 1 ]; then
 		if [ "$stopped" = 1 ]; then
 			warn "服务已停止；请稍后执行 dshctl start"
 		else
@@ -2247,44 +2575,53 @@ warn() { printf '%sWARN%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 err()  { printf '%sERROR%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 die()  { printf '%sERROR%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
-if [ -t 1 ]; then
-	C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_RESET=$'\033[0m'
-else
-	C_GREEN=''; C_YELLOW=''; C_RED=''; C_RESET=''
-fi
+# ── 基础工具 ─────────────────────────────────────────────────────────────────
+# setup_colors：TTY 上启用 ANSI 颜色，重定向到文件时留空以便日志可读。
+# 必须在任何 log/warn/err 之前调用。
+setup_colors() {
+	if [ -t 1 ]; then
+		C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_RESET=$'\033[0m'
+	else
+		C_GREEN=''; C_YELLOW=''; C_RED=''; C_RESET=''
+	fi
+}
 
 # ── 参数解析 ─────────────────────────────────────────────────────────────────
-while [ $# -gt 0 ]; do
-	case "$1" in
-		--port) OPT_PORT="${2:?--port 需要一个端口}"; shift 2 ;;
-		--port=*) OPT_PORT="${1#*=}"; shift ;;
-		--name) OPT_NAME="${2:?--name 需要一个名字}"; shift 2 ;;
-		--name=*) OPT_NAME="${1#*=}"; shift ;;
-		--node-major) OPT_NODE_MAJOR="${2:?--node-major 需要一个主版本号}"; shift 2 ;;
-		--node-major=*) OPT_NODE_MAJOR="${1#*=}"; shift ;;
-		--nvm-version) OPT_NVM_VERSION="${2:?--nvm-version 需要一个版本标签}"; shift 2 ;;
-		--nvm-version=*) OPT_NVM_VERSION="${1#*=}"; shift ;;
-		--dsh-version) OPT_DSH_VERSION="${2:?--dsh-version 需要一个版本}"; shift 2 ;;
-		--dsh-version=*) OPT_DSH_VERSION="${1#*=}"; shift ;;
-		--pnpm-version) OPT_PNPM_VERSION="${2:?--pnpm-version 需要一个版本}"; shift 2 ;;
-		--pnpm-version=*) OPT_PNPM_VERSION="${1#*=}"; shift ;;
-		--prefix) OPT_PREFIX="${2:?--prefix 需要一个目录}"; shift 2 ;;
-		--prefix=*) OPT_PREFIX="${1#*=}"; shift ;;
-		--mirror) OPT_MIRROR=1; shift ;;
-		--no-mirror) OPT_MIRROR=0; shift ;;
-		--no-pnpm) NO_PNPM=1; shift ;;
-		--no-service) NO_SERVICE=1; shift ;;
-		--no-linger) NO_LINGER=1; shift ;;
-		--no-rc) NO_RC=1; shift ;;
-		--force) FORCE=1; shift ;;
-		--strict-port) STRICT_PORT=1; shift ;;
-		--dry-run) DRY_RUN=1; shift ;;
-		--allow-root) ALLOW_ROOT=1; shift ;;
-		--print-dshctl) PRINT_DSHCTL=1; shift ;;
-		-h|--help) SHOW_HELP=1; shift ;;
-		*) die "未知参数: $1（试试 --help）" ;;
-	esac
-done
+# parse_args：解析命令行，把结果写入 OPT_* 与各开关变量（全部为全局）。
+# 未知参数在此处直接报错退出，早于任何安装步骤。
+parse_args() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--port) OPT_PORT="${2:?--port 需要一个端口}"; shift 2 ;;
+			--port=*) OPT_PORT="${1#*=}"; shift ;;
+			--name) OPT_NAME="${2:?--name 需要一个名字}"; shift 2 ;;
+			--name=*) OPT_NAME="${1#*=}"; shift ;;
+			--node-major) OPT_NODE_MAJOR="${2:?--node-major 需要一个主版本号}"; shift 2 ;;
+			--node-major=*) OPT_NODE_MAJOR="${1#*=}"; shift ;;
+			--nvm-version) OPT_NVM_VERSION="${2:?--nvm-version 需要一个版本标签}"; shift 2 ;;
+			--nvm-version=*) OPT_NVM_VERSION="${1#*=}"; shift ;;
+			--dsh-version) OPT_DSH_VERSION="${2:?--dsh-version 需要一个版本}"; shift 2 ;;
+			--dsh-version=*) OPT_DSH_VERSION="${1#*=}"; shift ;;
+			--pnpm-version) OPT_PNPM_VERSION="${2:?--pnpm-version 需要一个版本}"; shift 2 ;;
+			--pnpm-version=*) OPT_PNPM_VERSION="${1#*=}"; shift ;;
+			--prefix) OPT_PREFIX="${2:?--prefix 需要一个目录}"; shift 2 ;;
+			--prefix=*) OPT_PREFIX="${1#*=}"; shift ;;
+			--mirror) OPT_MIRROR=1; shift ;;
+			--no-mirror) OPT_MIRROR=0; shift ;;
+			--no-pnpm) NO_PNPM=1; shift ;;
+			--no-service) NO_SERVICE=1; shift ;;
+			--no-linger) NO_LINGER=1; shift ;;
+			--no-rc) NO_RC=1; shift ;;
+			--force) FORCE=1; shift ;;
+			--strict-port) STRICT_PORT=1; shift ;;
+			--dry-run) DRY_RUN=1; shift ;;
+			--allow-root) ALLOW_ROOT=1; shift ;;
+			--print-dshctl) PRINT_DSHCTL=1; shift ;;
+			-h|--help) SHOW_HELP=1; shift ;;
+			*) die "未知参数: $1（试试 --help）" ;;
+		esac
+	done
+}
 
 if [ "$PRINT_DSHCTL" = 1 ]; then
 	printf '%s\n' "$DSHCTL_SRC"
@@ -2296,150 +2633,171 @@ if [ "$SHOW_HELP" = 1 ]; then
 fi
 
 # ── 默认值：先取已有配置，再用命令行覆盖 ─────────────────────────────────────
-# HOME 必须在任何 $HOME/... 默认值之前检查：否则 set -u 会先以
-# “HOME: unbound variable” 崩溃，给出误导性的报错。
-if [ -z "${HOME:-}" ]; then
-	die "缺少 HOME 环境变量（无法定位 ~/.config、~/.dsh 与 ~/.nvm）"
-fi
-CONFIG_DIR="${DSHCTL_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-service}"
-CONFIG_FILE="$CONFIG_DIR/config"
-if [ -r "$CONFIG_FILE" ]; then
-	if ! bash -n -- "$CONFIG_FILE" 2>/dev/null; then
-		die "配置文件语法错误: $CONFIG_FILE（请修复或删除后重跑；不会覆盖损坏的文件）"
+# init_config：把内置默认值落到 DSH_SERVICE_* 上，设置 CONFIG_DIR/CONFIG_FILE。
+# ：= 语义——环境变量优先，其次配置文件，最后才是内置默认值。
+# 设置：CONFIG_DIR、CONFIG_FILE、DSH_SERVICE_*。
+init_config() {
+	# HOME 必须在任何 $HOME/... 默认值之前检查：否则 set -u 会先以
+	# “HOME: unbound variable” 崩溃，给出误导性的报错。
+	if [ -z "${HOME:-}" ]; then
+		die "缺少 HOME 环境变量（无法定位 ~/.config、~/.dsh 与 ~/.nvm）"
 	fi
-	# shellcheck source=/dev/null
-	. "$CONFIG_FILE"
-fi
-: "${DSH_SERVICE_NAME:=dsh}"
-: "${DSH_SERVICE_PROFILE:=web}"
-: "${DSH_SERVICE_HOST:=127.0.0.1}"
-: "${DSH_SERVICE_PORT:=3080}"
-: "${DSH_SERVICE_DSH_HOME:=$HOME/.dsh}"
-: "${DSH_SERVICE_NVM_DIR:=$HOME/.nvm}"
-: "${DSH_SERVICE_NODE_BIN_DIR:=}"
-: "${DSH_SERVICE_LOCAL_BIN:=$HOME/.local/bin}"
-: "${DSH_SERVICE_EXTRA_ARGS:=}"
+	CONFIG_DIR="${DSHCTL_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsh-service}"
+	CONFIG_FILE="$CONFIG_DIR/config"
+	if [ -r "$CONFIG_FILE" ]; then
+		if ! bash -n -- "$CONFIG_FILE" 2>/dev/null; then
+			die "配置文件语法错误: $CONFIG_FILE（请修复或删除后重跑；不会覆盖损坏的文件）"
+		fi
+		# shellcheck source=/dev/null
+		. "$CONFIG_FILE"
+	fi
+	: "${DSH_SERVICE_NAME:=$DEFAULT_NAME}"
+	: "${DSH_SERVICE_PROFILE:=$DEFAULT_PROFILE}"
+	: "${DSH_SERVICE_HOST:=$DEFAULT_HOST}"
+	: "${DSH_SERVICE_PORT:=$DEFAULT_PORT}"
+	: "${DSH_SERVICE_DSH_HOME:=$HOME/.dsh}"
+	: "${DSH_SERVICE_NVM_DIR:=$HOME/.nvm}"
+	: "${DSH_SERVICE_NODE_BIN_DIR:=}"
+	: "${DSH_SERVICE_LOCAL_BIN:=$HOME/.local/bin}"
+	: "${DSH_SERVICE_EXTRA_ARGS:=}"
+}
 
-# 记住「本次运行之前」生效的单元名（来自旧配置或环境）：--name 变更后旧单元
-# 仍会 enabled/运行，并可能与新单元抢同一端口，成功渲染新单元后需要清理它。
-PREV_NAME="$DSH_SERVICE_NAME"
-
-NAME="${OPT_NAME:-$DSH_SERVICE_NAME}"
-PORT="${OPT_PORT:-$DSH_SERVICE_PORT}"
-DSH_HOME="${DSH_SERVICE_DSH_HOME}"
-NVM_DIR="${DSH_SERVICE_NVM_DIR}"
-# 变量名不要用 PREFIX：nvm 会把 PREFIX 误认为 node 的安装前缀，
-# 只要它非空，`nvm install` 就会以 “not compatible with the PREFIX
-# environment variable” 直接失败（见 nvm.sh 的 nvm_do_install）。
-LOCAL_BIN_DIR="${OPT_PREFIX:-$DSH_SERVICE_LOCAL_BIN}"
-NODE_MAJOR="${OPT_NODE_MAJOR:-24}"
-# 保留已安装的 Node：未显式传入 --node-major 时，优先沿用配置里记录的 Node 二进制目录
-# 所对应的主版本，避免重跑 install.sh 把现有安装自动迁移到新的默认主版本（幂等契约）。
-# 记录缺失或目录已失效（新安装、被手工删除）时才回退到默认主版本。
-NODE_MAJOR_KEPT=0
-if [ -z "$OPT_NODE_MAJOR" ] && [ -n "$DSH_SERVICE_NODE_BIN_DIR" ] && [ -x "$DSH_SERVICE_NODE_BIN_DIR/node" ]; then
-	kept_major="$("$DSH_SERVICE_NODE_BIN_DIR/node" --version 2>/dev/null | sed -e 's/^v//' -e 's/\..*//' || true)"
-	case "$kept_major" in
-		''|*[!0-9]*) ;;
-		*)
-			NODE_MAJOR="$kept_major"
-			NODE_MAJOR_KEPT=1
-			;;
+# ── 取值校验 ─────────────────────────────────────────────────────────────────
+# validate_options：校验命令行与配置文件合并后的取值（端口范围、单元名字符集、
+# 版本字符集、前缀绝对路径）。任何一项非法都在此退出 1，早于任何安装步骤。
+# 会就地归一化 PORT 的前导零。
+validate_options() {
+	case "$PORT" in
+		''|*[!0-9]*) die "--port 需要数字，收到 '$PORT'" ;;
 	esac
-fi
-NVM_VERSION="${OPT_NVM_VERSION:-v0.40.1}"
-# 默认通道：dsh 以 rc 版本对外发布，npm 的 latest 常常落后于 next，因此新安装默认
-# 跟随 next（与内嵌 dshctl 的 DSH_DEFAULT_CHANNEL 保持一致）。--dsh-version 可显式
-# 覆盖为 latest / 其他 dist-tag / 具体版本。
-DSH_DEFAULT_CHANNEL='next'
-DSH_VERSION="${OPT_DSH_VERSION:-$DSH_DEFAULT_CHANNEL}"
-# pnpm 与 dsh 同为可选全局包：默认 latest，可用 --pnpm-version / DSH_PNPM_VERSION 固定。
-PNPM_VERSION="${OPT_PNPM_VERSION:-${DSH_PNPM_VERSION:-latest}}"
-# 实际解析/安装到的版本（dist-tag 会被解析成具体版本号），供末尾汇总显示。
-RESOLVED_DSH_VERSION="$DSH_VERSION"
-RESOLVED_PNPM_VERSION="$PNPM_VERSION"
-EXTRA_ARGS="$DSH_SERVICE_EXTRA_ARGS"
+	if [ "${#PORT}" -gt 5 ] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+		die "--port 必须在 1-65535 之间，收到 '$PORT'"
+	fi
+	# 归一化前导零：$((PORT + i)) 会把 080 当八进制直接报错、把 010 当成 8，
+	# 而 test/awk 又是十进制，混用会崩溃或换到错误端口。
+	PORT="$((10#$PORT))"
+	case "$NAME" in
+		''|*[!A-Za-z0-9_.@-]*) die "--name 只允许字母、数字、下划线、点、@ 和连字符，收到 '$NAME'" ;;
+	esac
+	case "$NODE_MAJOR" in
+		''|*[!A-Za-z0-9._/-]*) die "--node-major 只允许字母、数字、点、下划线、斜杠和连字符，收到 '$NODE_MAJOR'" ;;
+	esac
+	if [ "$NODE_MAJOR_KEPT" = 1 ]; then
+		log "沿用已安装的 Node 主版本 $NODE_MAJOR（$DSH_SERVICE_NODE_BIN_DIR）；如需切换请用 --node-major <主版本> 或 dshctl upgrade-node <主版本>"
+	fi
+	# --nvm-version 会被拼进下载 URL 并由 bash 执行，限制为 tag 形态的字符集，
+	# 并拒绝目录穿越（..）与以 - 开头（会被 install.sh 当选项）。
+	case "$NVM_VERSION" in
+		''|*[!A-Za-z0-9._-]*|*..*|-*) die "--nvm-version 只允许字母、数字、点、下划线和连字符（例如 v0.40.1），收到 '$NVM_VERSION'" ;;
+	esac
+	# pnpm 版本会作为 npm 参数（已加引号），仍限制字符集避免误传选项/注入。
+	case "$PNPM_VERSION" in
+		''|*[!A-Za-z0-9._+-]*) die "--pnpm-version 只允许字母、数字、点、下划线、加号和连字符（例如 9.15.0 或 latest），收到 '$PNPM_VERSION'" ;;
+	esac
+	case "$LOCAL_BIN_DIR" in
+		/*) ;;
+		*) die "--prefix 必须是绝对路径，收到 '$LOCAL_BIN_DIR'" ;;
+	esac
+	case "$LOCAL_BIN_DIR" in
+		*' '*|*$'\t'*) warn "--prefix 含空格或制表符（'$LOCAL_BIN_DIR'），systemd 单元的 ExecStart 可能无法正确解析。" ;;
+	esac
+}
 
-case "$PORT" in
-	''|*[!0-9]*) die "--port 需要数字，收到 '$PORT'" ;;
-esac
-if [ "${#PORT}" -gt 5 ] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-	die "--port 必须在 1-65535 之间，收到 '$PORT'"
-fi
-# 归一化前导零：$((PORT + i)) 会把 080 当八进制直接报错、把 010 当成 8，
-# 而 test/awk 又是十进制，混用会崩溃或换到错误端口。
-PORT="$((10#$PORT))"
-case "$NAME" in
-	''|*[!A-Za-z0-9_.@-]*) die "--name 只允许字母、数字、下划线、点、@ 和连字符，收到 '$NAME'" ;;
-esac
-case "$NODE_MAJOR" in
-	''|*[!A-Za-z0-9._/-]*) die "--node-major 只允许字母、数字、点、下划线、斜杠和连字符，收到 '$NODE_MAJOR'" ;;
-esac
-if [ "$NODE_MAJOR_KEPT" = 1 ]; then
-	log "沿用已安装的 Node 主版本 $NODE_MAJOR（$DSH_SERVICE_NODE_BIN_DIR）；如需切换请用 --node-major <主版本> 或 dshctl upgrade-node <主版本>"
-fi
-# --nvm-version 会被拼进下载 URL 并由 bash 执行，限制为 tag 形态的字符集，
-# 并拒绝目录穿越（..）与以 - 开头（会被 install.sh 当选项）。
-case "$NVM_VERSION" in
-	''|*[!A-Za-z0-9._-]*|*..*|-*) die "--nvm-version 只允许字母、数字、点、下划线和连字符（例如 v0.40.1），收到 '$NVM_VERSION'" ;;
-esac
-# pnpm 版本会作为 npm 参数（已加引号），仍限制字符集避免误传选项/注入。
-case "$PNPM_VERSION" in
-	''|*[!A-Za-z0-9._+-]*) die "--pnpm-version 只允许字母、数字、点、下划线、加号和连字符（例如 9.15.0 或 latest），收到 '$PNPM_VERSION'" ;;
-esac
-case "$LOCAL_BIN_DIR" in
-	/*) ;;
-	*) die "--prefix 必须是绝对路径，收到 '$LOCAL_BIN_DIR'" ;;
-esac
-case "$LOCAL_BIN_DIR" in
-	*' '*|*$'\t'*) warn "--prefix 含空格或制表符（'$LOCAL_BIN_DIR'），systemd 单元的 ExecStart 可能无法正确解析。" ;;
-esac
+# ── 派生变量 ─────────────────────────────────────────────────────────────────
+# init_derived_values：由已校验的取值算出后续步骤要用的变量（单元名/路径、
+# dshctl 路径、生效版本），并处理「沿用已安装 Node 主版本」的幂等逻辑。
+# 设置：UNIT_NAME、UNIT_FILE、DSHCTL_BIN、NODE_MAJOR、NODE_MAJOR_KEPT、
+#       RESOLVED_DSH_VERSION、RESOLVED_PNPM_VERSION。
+init_derived_values() {
+	local kept_major=''
 
-UNIT_NAME="$NAME.service"
-UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT_NAME"
-DSHCTL_BIN="$LOCAL_BIN_DIR/dshctl"
+	# 记住「本次运行之前」生效的单元名（来自旧配置或环境）：--name 变更后旧单元
+	# 仍会 enabled/运行，并可能与新单元抢同一端口，成功渲染新单元后需要清理它。
+	PREV_NAME="$DSH_SERVICE_NAME"
+
+	NAME="${OPT_NAME:-$DSH_SERVICE_NAME}"
+	PORT="${OPT_PORT:-$DSH_SERVICE_PORT}"
+	DSH_HOME="${DSH_SERVICE_DSH_HOME}"
+	NVM_DIR="${DSH_SERVICE_NVM_DIR}"
+	# 变量名不要用 PREFIX：nvm 会把 PREFIX 误认为 node 的安装前缀，
+	# 只要它非空，`nvm install` 就会以 “not compatible with the PREFIX
+	# environment variable” 直接失败（见 nvm.sh 的 nvm_do_install）。
+	LOCAL_BIN_DIR="${OPT_PREFIX:-$DSH_SERVICE_LOCAL_BIN}"
+	NODE_MAJOR="${OPT_NODE_MAJOR:-$DEFAULT_NODE_MAJOR}"
+	NVM_VERSION="${OPT_NVM_VERSION:-$DEFAULT_NVM_VERSION}"
+	# 默认通道：dsh 以 rc 版本对外发布，npm 的 latest 常常落后于 next，因此新安装
+	# 默认跟随 next（与内嵌 dshctl 的 DEFAULT_DSH_CHANNEL 保持一致）。--dsh-version
+	# 可显式覆盖为 latest / 其他 dist-tag / 具体版本。
+	DSH_VERSION="${OPT_DSH_VERSION:-$DEFAULT_DSH_CHANNEL}"
+	# pnpm 与 dsh 同为可选全局包：默认 latest，可用 --pnpm-version / DSH_PNPM_VERSION 固定。
+	PNPM_VERSION="${OPT_PNPM_VERSION:-${DSH_PNPM_VERSION:-$DEFAULT_PNPM_VERSION}}"
+	EXTRA_ARGS="$DSH_SERVICE_EXTRA_ARGS"
+
+	# 保留已安装的 Node：未显式传入 --node-major 时，优先沿用配置里记录的 Node 二进制目录
+	# 所对应的主版本，避免重跑 install.sh 把现有安装自动迁移到新的默认主版本（幂等契约）。
+	# 记录缺失或目录已失效（新安装、被手工删除）时才回退到默认主版本。
+	NODE_MAJOR_KEPT=0
+	if [ -z "$OPT_NODE_MAJOR" ] && [ -n "$DSH_SERVICE_NODE_BIN_DIR" ] && [ -x "$DSH_SERVICE_NODE_BIN_DIR/node" ]; then
+		kept_major="$("$DSH_SERVICE_NODE_BIN_DIR/node" --version 2>/dev/null | sed -e 's/^v//' -e 's/\..*//' || true)"
+		case "$kept_major" in
+			''|*[!0-9]*) ;;
+			*)
+				NODE_MAJOR="$kept_major"
+				NODE_MAJOR_KEPT=1
+				;;
+		esac
+	fi
+	# 实际解析/安装到的版本（dist-tag 会被解析成具体版本号），供末尾汇总显示。
+	RESOLVED_DSH_VERSION="$DSH_VERSION"
+	RESOLVED_PNPM_VERSION="$PNPM_VERSION"
+	UNIT_NAME="$NAME.service"
+	UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT_NAME"
+	DSHCTL_BIN="$LOCAL_BIN_DIR/dshctl"
+}
 
 # ── 镜像源（默认国内；apt/dnf/yum 等系统包管理器的软件源不在此列） ───────────
-# npm 与 Node 二进制默认走 npmmirror，nvm 的安装脚本与仓库默认走 Gitee 镜像。
-# DSH_SERVICE_MIRROR / DSH_SERVICE_NPM_REGISTRY / DSH_SERVICE_NODE_MIRROR 会被写入
-# 配置，供 dshctl upgrade / upgrade-node 复用；--mirror / --no-mirror 是本次运行的
-# 显式切换，会连同具体 URL 覆盖配置里的旧值（否则切换模式会被旧 URL 抵消）。
-: "${DSH_SERVICE_MIRROR:=1}"
-if [ -n "$OPT_MIRROR" ]; then
-	DSH_SERVICE_MIRROR="$OPT_MIRROR"
-	unset DSH_SERVICE_NPM_REGISTRY DSH_SERVICE_NODE_MIRROR DSH_NVM_SOURCE DSH_NVM_INSTALL_URL
-fi
-case "$DSH_SERVICE_MIRROR" in
-	1|0) ;;
-	*) die "DSH_SERVICE_MIRROR 只能是 1（国内镜像）或 0（官方源），收到 '$DSH_SERVICE_MIRROR'" ;;
-esac
-if [ "$DSH_SERVICE_MIRROR" = 1 ]; then
-	: "${DSH_SERVICE_NPM_REGISTRY:=https://registry.npmmirror.com}"
-	: "${DSH_SERVICE_NODE_MIRROR:=https://npmmirror.com/mirrors/node}"
-else
-	: "${DSH_SERVICE_NPM_REGISTRY:=https://registry.npmjs.org}"
-	: "${DSH_SERVICE_NODE_MIRROR:=}"
-fi
-# nvm 安装脚本：默认同样从 Gitee 镜像下载 nvm 官方脚本（内容与 raw.githubusercontent 一致）。
-if [ -n "${DSH_NVM_INSTALL_URL:-}" ]; then
-	NVM_INSTALL_URL="$DSH_NVM_INSTALL_URL"
-elif [ "$DSH_SERVICE_MIRROR" = 1 ]; then
-	NVM_INSTALL_URL="https://gitee.com/mirrors/nvm/raw/$NVM_VERSION/install.sh"
-else
-	NVM_INSTALL_URL="https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_VERSION/install.sh"
-fi
-# NVM_SOURCE（git clone 的仓库地址）只在 nvm 走 git 方式时有效：没有 git 时 nvm
-# 改用脚本下载，此时若仍导出仓库地址，nvm 会把 "<repo>.git" 当成 nvm.sh 下载，
-# 结果是一份无法加载的假 nvm.sh。
-NVM_SOURCE_EFFECTIVE="${DSH_NVM_SOURCE:-}"
-if [ -z "$NVM_SOURCE_EFFECTIVE" ] && [ "$DSH_SERVICE_MIRROR" = 1 ]; then
-	NVM_SOURCE_EFFECTIVE="https://gitee.com/mirrors/nvm.git"
-fi
-if [ -n "$NVM_SOURCE_EFFECTIVE" ] && ! command -v git >/dev/null 2>&1; then
-	warn "未找到 git：nvm 将以脚本方式安装，NVM_SOURCE 镜像不生效（nvm-exec 等仍需访问 GitHub）"
-	NVM_SOURCE_EFFECTIVE=""
-fi
-
+# init_mirrors：决定本次运行的镜像模式与具体 URL，并算出 nvm 安装脚本地址与
+# NVM_SOURCE。--mirror / --no-mirror 是本次运行的显式切换，会连同具体 URL 覆盖
+# 配置里的旧值（否则切换模式会被旧 URL 抵消）。
+# 设置：DSH_SERVICE_MIRROR、DSH_SERVICE_NPM_REGISTRY、DSH_SERVICE_NODE_MIRROR、
+#       NVM_INSTALL_URL、NVM_SOURCE_EFFECTIVE。
+init_mirrors() {
+	: "${DSH_SERVICE_MIRROR:=1}"
+	if [ -n "$OPT_MIRROR" ]; then
+		DSH_SERVICE_MIRROR="$OPT_MIRROR"
+		unset DSH_SERVICE_NPM_REGISTRY DSH_SERVICE_NODE_MIRROR DSH_NVM_SOURCE DSH_NVM_INSTALL_URL
+	fi
+	case "$DSH_SERVICE_MIRROR" in
+		1|0) ;;
+		*) die "DSH_SERVICE_MIRROR 只能是 1（国内镜像）或 0（官方源），收到 '$DSH_SERVICE_MIRROR'" ;;
+	esac
+	if [ "$DSH_SERVICE_MIRROR" = 1 ]; then
+		: "${DSH_SERVICE_NPM_REGISTRY:=$MIRROR_NPM_REGISTRY}"
+		: "${DSH_SERVICE_NODE_MIRROR:=$MIRROR_NODE_MIRROR}"
+	else
+		: "${DSH_SERVICE_NPM_REGISTRY:=$OFFICIAL_NPM_REGISTRY}"
+		: "${DSH_SERVICE_NODE_MIRROR:=}"
+	fi
+	# nvm 安装脚本：默认同样从 Gitee 镜像下载 nvm 官方脚本（内容与 raw 一致）。
+	if [ -n "${DSH_NVM_INSTALL_URL:-}" ]; then
+		NVM_INSTALL_URL="$DSH_NVM_INSTALL_URL"
+	elif [ "$DSH_SERVICE_MIRROR" = 1 ]; then
+		NVM_INSTALL_URL="$MIRROR_NVM_INSTALL_URL_BASE/$NVM_VERSION/install.sh"
+	else
+		NVM_INSTALL_URL="$OFFICIAL_NVM_INSTALL_URL_BASE/$NVM_VERSION/install.sh"
+	fi
+	# NVM_SOURCE（git clone 的仓库地址）只在 nvm 走 git 方式时有效：没有 git 时 nvm
+	# 改用脚本下载，此时若仍导出仓库地址，nvm 会把 "<repo>.git" 当成 nvm.sh 下载，
+	# 结果是一份无法加载的假 nvm.sh。
+	NVM_SOURCE_EFFECTIVE="${DSH_NVM_SOURCE:-}"
+	if [ -z "$NVM_SOURCE_EFFECTIVE" ] && [ "$DSH_SERVICE_MIRROR" = 1 ]; then
+		NVM_SOURCE_EFFECTIVE="$MIRROR_NVM_REPO.git"
+	fi
+	if [ -n "$NVM_SOURCE_EFFECTIVE" ] && ! command -v git >/dev/null 2>&1; then
+		warn "未找到 git：nvm 将以脚本方式安装，NVM_SOURCE 镜像不生效（nvm-exec 等仍需访问 GitHub）"
+		NVM_SOURCE_EFFECTIVE=""
+	fi
+}
 # apply_mirrors：把上面的设置注入 npm 与 nvm。用户环境里已显式设置的
 # npm_config_registry / NVM_NODEJS_ORG_MIRROR / NVM_SOURCE 优先，不被覆盖。
 apply_mirrors() {
@@ -2454,30 +2812,14 @@ apply_mirrors() {
 	fi
 }
 
-log "dsh-service 安装器 v$INSTALLER_VERSION（dry-run=${DRY_RUN}）"
-
-if [ "$(id -u)" -eq 0 ] && [ "$ALLOW_ROOT" != 1 ]; then
-	die "检测到以 root 运行。用户级 systemd 服务应使用普通用户安装；如确需如此请加 --allow-root。"
-fi
-case "$HOME" in
-	*' '*|*$'\t'*|*:*)
-		warn "HOME 路径包含空格、制表符或冒号（'$HOME'），systemd 单元可能无法正确解析。"
-		;;
-esac
-case "$DSH_HOME/" in
-	/mnt/*)
-		warn "DSH_HOME 位于 /mnt（WSL drvfs 的符号链接不可靠，profile 初始化可能失败）：$DSH_HOME"
-		warn "建议用 DSH_SERVICE_DSH_HOME=/home/<用户>/.dsh 指定 Linux 原生路径后重跑。"
-		;;
-esac
-
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
 # 临时文件登记表：任何退出路径都会清理（write_file、nvm 安装脚本）。
 TMP_FILES=()
 cleanup_tmp() {
 	local f
 	for f in ${TMP_FILES[@]+"${TMP_FILES[@]}"}; do
-		rm -f -- "$f" 2>/dev/null || true
+		# 与内嵌 dshctl 一致用 -rf：注册项既可能是 mktemp 文件，也可能是临时目录。
+		rm -rf -- "$f" 2>/dev/null || true
 	done
 	return 0
 }
@@ -2655,14 +2997,14 @@ ensure_nvm() {
 	TMP_FILES+=("$tmp")
 	log "下载 nvm 安装脚本 $NVM_VERSION ..."
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL -o "$tmp" "$url" || die "nvm 安装脚本下载失败（网络不可用？）：$url"
+		curl -fsSL -o "$tmp" "$url" || die "nvm 安装脚本下载失败（网络不可用？）：$url（可加 --mirror 走 Gitee 镜像后重试）"
 	elif command -v wget >/dev/null 2>&1; then
-		wget -qO "$tmp" "$url" || die "nvm 安装脚本下载失败（网络不可用？）：$url"
+		wget -qO "$tmp" "$url" || die "nvm 安装脚本下载失败（网络不可用？）：$url（可加 --mirror 走 Gitee 镜像后重试）"
 	else
-		die "缺少 curl/wget，无法安装 nvm"
+		die "缺少 curl/wget，无法安装 nvm（请先安装其一，例如：sudo apt install curl）"
 	fi
 	if [ ! -s "$tmp" ]; then
-		die "nvm 安装脚本为空: $url"
+		die "nvm 安装脚本为空: $url（下载被中断或镜像不可用；重跑 install.sh 或加 --mirror）"
 	fi
 	if [ -n "$sha" ]; then
 		if ! command -v sha256sum >/dev/null 2>&1; then
@@ -2679,33 +3021,35 @@ ensure_nvm() {
 	fi
 	log "安装 nvm $NVM_VERSION ..."
 	if ! bash "$tmp"; then
-		die "nvm 安装失败（网络不可用？）：$url"
+		die "nvm 安装失败（网络不可用？）：$url（可加 --mirror 走 Gitee 镜像后重试）"
 	fi
 	rm -f -- "$tmp"
 	if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-		die "nvm 安装后仍未找到 $NVM_DIR/nvm.sh（可能安装到了其他 NVM_DIR）"
+		die "nvm 安装后仍未找到 $NVM_DIR/nvm.sh（可能安装到了其他 NVM_DIR）。请检查 $NVM_DIR 或移除后重跑 install.sh"
 	fi
 }
 
 # ── 步骤 2：Node ─────────────────────────────────────────────────────────────
-# load_nvm：必须在当前 shell 中加载（要拿到 nvm 函数与 PATH 改动）。
-load_nvm() {
+# try_load_nvm：在当前 shell 中加载 nvm（要拿到 nvm 函数与 PATH 改动）。
+# nvm 缺失/损坏时安静返回 1，供可恢复路径使用；硬依赖入口请用 load_nvm。
+# 与内嵌 dshctl 的 try_load_nvm 保持同名同分工（两段脚本不能互相 source）。
+try_load_nvm() {
+	[ -s "$NVM_DIR/nvm.sh" ] || return 1
 	# 同 dshctl：nvm 遇到已设置的 PREFIX 会拒绝执行 `nvm install`（哪怕它来自其他工具）。
 	unset PREFIX
 	export NVM_DIR="$NVM_DIR"
 	# shellcheck source=/dev/null
-	if ! with_loose_shell . "$NVM_DIR/nvm.sh" --no-use; then
-		die "无法加载 nvm（$NVM_DIR/nvm.sh 缺失或损坏）。请删除 $NVM_DIR 后重跑 install.sh。"
-	fi
+	with_loose_shell . "$NVM_DIR/nvm.sh" --no-use >/dev/null 2>&1
 }
 
-# load_nvm_soft：nvm 缺失/损坏时安静返回 1，不中断安装（Node 可能已经装好了）。
+# load_nvm：nvm 是硬依赖的入口（安装 Node 时需要它的函数与 PATH 改动）。
+load_nvm() {
+	try_load_nvm || die "无法加载 nvm（$NVM_DIR/nvm.sh 缺失或损坏）。请删除 $NVM_DIR 后重跑 install.sh。"
+}
+
+# load_nvm_soft：try_load_nvm 的旧名，保留以兼容既有调用点。
 load_nvm_soft() {
-	[ -s "$NVM_DIR/nvm.sh" ] || return 1
-	unset PREFIX
-	export NVM_DIR="$NVM_DIR"
-	# shellcheck source=/dev/null
-	with_loose_shell . "$NVM_DIR/nvm.sh" --no-use >/dev/null 2>&1
+	try_load_nvm
 }
 
 # nvm_local_node_bin：~/.nvm 下已经装好的、与 --node-major 匹配的 node。
@@ -2765,8 +3109,8 @@ ensure_node() {
 		return 0
 	fi
 	# 下载失败时的重试次数与间隔（秒）；间隔设 0 便于快速重试。
-	: "${DSH_SERVICE_NODE_ATTEMPTS:=3}"
-	: "${DSH_SERVICE_NODE_RETRY_DELAY:=5}"
+	: "${DSH_SERVICE_NODE_ATTEMPTS:=$NODE_ATTEMPTS_DEFAULT}"
+	: "${DSH_SERVICE_NODE_RETRY_DELAY:=$NODE_RETRY_DELAY_DEFAULT}"
 	case "$DSH_SERVICE_NODE_ATTEMPTS" in
 		''|*[!0-9]*) die "DSH_SERVICE_NODE_ATTEMPTS 必须是正整数，收到 '$DSH_SERVICE_NODE_ATTEMPTS'" ;;
 	esac
@@ -2813,13 +3157,28 @@ ensure_node() {
 		''|*[!0-9]*) ;;
 		*)
 			if [ "$(node --version 2>/dev/null | sed -e 's/^v//' -e 's/\..*//')" != "$NODE_MAJOR" ]; then
-				die "Node $NODE_MAJOR 安装后版本不匹配：$(node --version 2>/dev/null || printf '未知')"
+				die "Node $NODE_MAJOR 安装后版本不匹配：$(node --version 2>/dev/null || printf '未知')。请删除 $NVM_DIR 后重跑 install.sh"
 			fi
 			;;
 	esac
 	use_node_bin "$bin"
 	nvm_set_default
 	log "Node $(node --version)（$NODE_BIN_DIR）"
+}
+
+# npm_failure_hint：npm 全局安装失败时的补救建议。与 ensure_node 的 Node 下载
+# 失败提示保持对称——按当前镜像模式给出对应的切换/重试办法。
+npm_failure_hint() {
+	local pkg="$1"
+	err "  1) 直接重跑 install.sh 再试一次（网络抖动常见）"
+	if [ "$DSH_SERVICE_MIRROR" = 1 ]; then
+		err "  2) 当前 registry 为 $DSH_SERVICE_NPM_REGISTRY；可换其它镜像后重跑："
+		err "       DSH_SERVICE_NPM_REGISTRY=https://<镜像>/ bash install.sh"
+	else
+		err "  2) 当前为官方源（$DSH_SERVICE_NPM_REGISTRY）；国内网络可切换国内镜像后重跑："
+		err "       bash install.sh --mirror"
+	fi
+	err "  3) 也可手动安装后重跑：npm install -g $pkg"
 }
 
 # ── 步骤 3：安装 dsh ─────────────────────────────────────────────────────────
@@ -2870,7 +3229,7 @@ ensure_dsh() {
 	# 默认通道只作用于新安装：未显式指定 --dsh-version（且未 --force）时，已有安装保持
 	# 原样，不跟随默认通道升级——与 Node 主版本的保留规则一致，切换通道是用户的显式动作。
 	if [ "$FORCE" != 1 ] && [ -z "$OPT_DSH_VERSION" ] && [ -n "$current" ]; then
-		log "dsh $current 已安装，保留现有版本（默认通道 $DSH_DEFAULT_CHANNEL；如需切换请用 --dsh-version $DSH_DEFAULT_CHANNEL 或 dshctl upgrade）"
+		log "dsh $current 已安装，保留现有版本（默认通道 $DEFAULT_DSH_CHANNEL；如需切换请用 --dsh-version $DEFAULT_DSH_CHANNEL 或 dshctl upgrade）"
 		RESOLVED_DSH_VERSION="$current"
 		return 0
 	fi
@@ -2895,7 +3254,9 @@ ensure_dsh() {
 	fi
 	log "安装 @deepseek-ai/dsh@$DSH_VERSION ..."
 	if ! npm install -g "@deepseek-ai/dsh@$DSH_VERSION"; then
-		die "npm install -g @deepseek-ai/dsh@$DSH_VERSION 失败"
+		err "npm install -g @deepseek-ai/dsh@$DSH_VERSION 失败。"
+		npm_failure_hint "@deepseek-ai/dsh@$DSH_VERSION"
+		exit 1
 	fi
 	current="$(normalize_version "$(dsh --version 2>/dev/null || true)")"
 	RESOLVED_DSH_VERSION="${current:-$target}"
@@ -2936,6 +3297,7 @@ ensure_pnpm() {
 	log "安装 pnpm@$PNPM_VERSION ..."
 	if ! npm install -g "pnpm@$PNPM_VERSION"; then
 		warn "npm install -g pnpm@$PNPM_VERSION 失败（可稍后重试；不影响 dsh 服务）"
+		npm_failure_hint "pnpm@$PNPM_VERSION"
 		PNPM_OK=0
 		return 0
 	fi
@@ -2959,7 +3321,7 @@ install_tools() {
 	else
 		gbin="$(npm prefix -g 2>/dev/null | tail -n 1)/bin/dsh"
 		if [ ! -x "$gbin" ]; then
-			die "未找到全局 dsh 可执行文件: $gbin"
+			die "未找到全局 dsh 可执行文件: $gbin（npm 安装可能未生成 bin；可重跑 install.sh）"
 		fi
 		ln -sfn -- "$gbin" "$LOCAL_BIN_DIR/dsh"
 		log "稳定入口: $LOCAL_BIN_DIR/dsh -> $gbin"
@@ -2968,6 +3330,24 @@ install_tools() {
 }
 
 # ── 步骤 6：shell 配置 ───────────────────────────────────────────────────────
+# rc_block_content：输出写入 ~/.bashrc 的 dsh-service 代码块（stdout）。
+# 只有在块外还没有 NVM_DIR 时才写 nvm 加载语句，避免与用户/其它工具重复；
+# PATH 那一行用 case 保证重复执行也只添加一次。
+# begin/end 是标记行，由调用方传入并与移除逻辑共用同一对常量。
+rc_block_content() {
+	local base="$1" begin="$2" end="$3"
+	printf '\n%s\n' "$begin"
+	printf '%s\n' '# nvm 与 ~/.local/bin（由 dsh-service install.sh 添加）'
+	if ! printf '%s' "$base" | grep -q 'NVM_DIR'; then
+		printf 'export NVM_DIR="%s"\n' "$(rc_q "$NVM_DIR")"
+		printf '%s\n' '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+		printf '%s\n' '[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"'
+	fi
+	printf 'case ":$PATH:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac\n' \
+		"$(rc_q "$LOCAL_BIN_DIR")" "$(rc_q "$LOCAL_BIN_DIR")"
+	printf '%s\n' "$end"
+}
+
 ensure_shell_rc() {
 	if [ "$NO_RC" = 1 ]; then
 		log "已跳过 shell 配置（--no-rc）"
@@ -3004,18 +3384,7 @@ ensure_shell_rc() {
 	blocktmp="$(mktemp "$(dirname -- "$rc")/.dsh-rc-block.XXXXXX")" \
 		|| die "无法在 $(dirname -- "$rc") 创建临时文件（请检查该目录权限）"
 	TMP_FILES+=("$blocktmp")
-	{
-		printf '\n%s\n' "$begin"
-		printf '%s\n' '# nvm 与 ~/.local/bin（由 dsh-service install.sh 添加）'
-		if ! printf '%s' "$base" | grep -q 'NVM_DIR'; then
-			printf 'export NVM_DIR="%s"\n' "$(rc_q "$NVM_DIR")"
-			printf '%s\n' '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
-			printf '%s\n' '[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"'
-		fi
-		printf 'case ":$PATH:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac\n' \
-			"$(rc_q "$LOCAL_BIN_DIR")" "$(rc_q "$LOCAL_BIN_DIR")"
-		printf '%s\n' "$end"
-	} > "$blocktmp"
+		rc_block_content "$base" "$begin" "$end" > "$blocktmp"
 
 	newtmp="$(mktemp "$(dirname -- "$rc")/.dsh-rc.XXXXXX")" \
 		|| die "无法在 $(dirname -- "$rc") 创建临时文件（请检查该目录权限）"
@@ -3135,58 +3504,63 @@ apply_service() {
 }
 
 # ── 执行 ─────────────────────────────────────────────────────────────────────
-# 先注入镜像设置（npm registry / nvm Node 源），后续所有 npm / nvm 调用都会继承。
-apply_mirrors
+# run_install_steps：按顺序执行安装流水线。每步自身幂等——已完成的步骤会被
+# 检测到并跳过，因此重复运行 install.sh 是安全的。
+# 设置全局 NODE_BIN_DIR（供 summarize 之前的状态一致）。
+run_install_steps() {
+	apply_mirrors
+	resolve_port
+	log "单元=$UNIT_NAME 端口=$PORT 前缀=$LOCAL_BIN_DIR"
 
-# 安装前先做端口预检：被占用时自动改用后续空闲端口（--strict-port 则直接报错）。
-resolve_port
-log "单元=$UNIT_NAME 端口=$PORT 前缀=$LOCAL_BIN_DIR"
+	ensure_nvm
+	ensure_node
+	ensure_dsh
+	ensure_pnpm
+	install_tools
+	ensure_shell_rc
 
-ensure_nvm
-ensure_node
-ensure_dsh
-ensure_pnpm
-install_tools
-ensure_shell_rc
-
-if [ "$DRY_RUN" = 1 ]; then
-	NODE_BIN_DIR="/placeholder/node/bin"
-fi
-render_via_dshctl
-retire_previous_unit "$PREV_NAME"
-apply_service
+	if [ "$DRY_RUN" = 1 ]; then
+		NODE_BIN_DIR="/placeholder/node/bin"
+	fi
+	render_via_dshctl
+	retire_previous_unit "$PREV_NAME"
+	apply_service
+}
 
 # ── 汇总 ─────────────────────────────────────────────────────────────────────
-printf '\n'
-log "安装完成"
-printf '  版本     : dsh %s / node %s\n' "$RESOLVED_DSH_VERSION" "$([ "$DRY_RUN" = 1 ] && printf '（dry-run）' || node --version 2>/dev/null || printf '未知')"
-if [ "$NO_PNPM" = 1 ]; then
-	printf '  pnpm     : 已跳过（--no-pnpm）\n'
-elif [ "$PNPM_OK" = 1 ]; then
-	printf '  pnpm     : %s\n' "$RESOLVED_PNPM_VERSION"
-else
-	printf '  pnpm     : 未安装（见上方 WARN，可重跑 install.sh）\n'
-fi
-if [ "$DSH_SERVICE_MIRROR" = 1 ]; then
-	printf '  镜像     : 国内（npm %s）\n' "$DSH_SERVICE_NPM_REGISTRY"
-else
-	printf '  镜像     : 官方源（--no-mirror）\n'
-fi
-printf '  地址     : http://%s:%s\n' "$DSH_SERVICE_HOST" "$PORT"
-printf '  单元     : %s\n' "$UNIT_FILE"
-printf '  配置     : %s\n' "$CONFIG_FILE"
-printf '  dshctl   : %s\n' "$DSHCTL_BIN"
-
-if [ "$DRY_RUN" = 0 ] && [ "$NO_SERVICE" != 1 ] && [ "$SERVICE_OK" = 1 ]; then
-	login_url="$("$DSHCTL_BIN" url --wait 30 2>/dev/null || true)"
-	if [ -n "$login_url" ]; then
-		printf '\n  登录链接 : %s\n' "$login_url"
+# print_summary：打印安装摘要与后续步骤。返回 1 表示服务未成功启用，
+# 由 main 据此以退出码 1 结束。
+print_summary() {
+	printf '\n'
+	log "安装完成"
+	printf '  版本     : dsh %s / node %s\n' "$RESOLVED_DSH_VERSION" "$([ "$DRY_RUN" = 1 ] && printf '（dry-run）' || node --version 2>/dev/null || printf '未知')"
+	if [ "$NO_PNPM" = 1 ]; then
+		printf '  pnpm     : 已跳过（--no-pnpm）\n'
+	elif [ "$PNPM_OK" = 1 ]; then
+		printf '  pnpm     : %s\n' "$RESOLVED_PNPM_VERSION"
 	else
-		printf '\n  登录链接 : 暂未取到，稍后执行 dshctl url\n'
+		printf '  pnpm     : 未安装（见上方 WARN，可重跑 install.sh）\n'
 	fi
-fi
+	if [ "$DSH_SERVICE_MIRROR" = 1 ]; then
+		printf '  镜像     : 国内（npm %s）\n' "$DSH_SERVICE_NPM_REGISTRY"
+	else
+		printf '  镜像     : 官方源（--no-mirror）\n'
+	fi
+	printf '  地址     : http://%s:%s\n' "$DSH_SERVICE_HOST" "$PORT"
+	printf '  单元     : %s\n' "$UNIT_FILE"
+	printf '  配置     : %s\n' "$CONFIG_FILE"
+	printf '  dshctl   : %s\n' "$DSHCTL_BIN"
 
-cat <<'EOF'
+	if [ "$DRY_RUN" = 0 ] && [ "$NO_SERVICE" != 1 ] && [ "$SERVICE_OK" = 1 ]; then
+		login_url="$("$DSHCTL_BIN" url --wait "$DEFAULT_URL_WAIT_SEC" 2>/dev/null || true)"
+		if [ -n "$login_url" ]; then
+			printf '\n  登录链接 : %s\n' "$login_url"
+		else
+			printf '\n  登录链接 : 暂未取到，稍后执行 dshctl url\n'
+		fi
+	fi
+
+	cat <<'EOF'
 
 下一步
   * 模型密钥在 Web 界面的设置页配置（本脚本不处理 DEEPSEEK_API_KEY）。
@@ -3203,17 +3577,67 @@ cat <<'EOF'
       然后在本机浏览器打开 dshctl url 输出的链接。
 EOF
 
-if [ "$SERVICE_OK" != 1 ]; then
-	printf '\n'
-	err "服务未成功启用；请按上方提示处理后执行: dshctl enable"
-	exit 1
-fi
+	if [ "$SERVICE_OK" != 1 ]; then
+		printf '\n'
+		err "服务未成功启用；请按上方提示处理后执行: dshctl enable"
+		return 1
+	fi
 
-if [ "$DRY_RUN" = 0 ] && [ "$NO_SERVICE" != 1 ]; then
-	case ":$PATH:" in
-		*":$LOCAL_BIN_DIR:"*) ;;
-		*) warn "$LOCAL_BIN_DIR 尚未在当前 shell 的 PATH 中：重新登录或执行 export PATH=\"$LOCAL_BIN_DIR:\$PATH\"" ;;
+	if [ "$DRY_RUN" = 0 ] && [ "$NO_SERVICE" != 1 ]; then
+		case ":$PATH:" in
+			*":$LOCAL_BIN_DIR:"*) ;;
+			*) warn "$LOCAL_BIN_DIR 尚未在当前 shell 的 PATH 中：重新登录或执行 export PATH=\"$LOCAL_BIN_DIR:\$PATH\"" ;;
+		esac
+	fi
+	return 0
+}
+
+# ── 入口 ─────────────────────────────────────────────────────────────────────
+# main：安装器入口。解析参数 → 初始化取值 → 执行流水线 → 打印摘要。
+# 先定义后执行：本函数只在文件末尾被调用一次。
+main() {
+	# 颜色必须先就绪：parse_args 里未知参数就会调用 die，而 die 会读 C_RED。
+	setup_colors
+	parse_args "$@"
+
+	if [ "$PRINT_DSHCTL" = 1 ]; then
+		printf '%s\n' "$DSHCTL_SRC"
+		exit 0
+	fi
+	if [ "$SHOW_HELP" = 1 ]; then
+		usage
+		exit 0
+	fi
+
+	init_config
+	init_derived_values
+	validate_options
+	init_mirrors
+
+	log "dsh-service 安装器 v$INSTALLER_VERSION（dry-run=${DRY_RUN}）"
+
+	if [ "$(id -u)" -eq 0 ] && [ "$ALLOW_ROOT" != 1 ]; then
+		die "检测到以 root 运行。用户级 systemd 服务应使用普通用户安装；如确需如此请加 --allow-root。"
+	fi
+	case "$HOME" in
+		*' '*|*$'\t'*|*:*)
+			warn "HOME 路径包含空格、制表符或冒号（'$HOME'），systemd 单元可能无法正确解析。"
+			;;
 	esac
-fi
+	case "$DSH_HOME/" in
+		/mnt/*)
+			warn "DSH_HOME 位于 /mnt（WSL drvfs 的符号链接不可靠，profile 初始化可能失败）：$DSH_HOME"
+			warn "建议用 DSH_SERVICE_DSH_HOME=/home/<用户>/.dsh 指定 Linux 原生路径后重跑。"
+			;;
+	esac
 
-exit 0
+	run_install_steps
+
+	if ! print_summary; then
+		exit 1
+	fi
+	exit 0
+}
+
+# 顶层只做一件事：调用入口。main 内部负责所有初始化与退出码。
+main "$@"
