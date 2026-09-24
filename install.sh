@@ -5,7 +5,7 @@
 #  依次完成（可重复执行，幂等）：
 #    0. 端口预检（被占用时自动改用后续空闲端口；--strict-port 则报错退出）
 #    1. 安装 nvm 并安装 Node.js 24（默认；已有安装沿用其现有 Node 主版本）
-#    2. npm 全局安装 @deepseek-ai/dsh，并在 ~/.local/bin 建立稳定入口
+#    2. npm 全局安装 @deepseek-ai/dsh（默认通道 next），并在 ~/.local/bin 建立稳定入口
 #    3. npm 全局安装 pnpm（可选；失败只告警，不影响 dsh 服务）
 #    4. 写入并启用用户级 systemd 服务（dsh web），同时安装 dshctl 管理工具
 #
@@ -115,6 +115,11 @@ DSH_SERVICE_UNIT_NAME="$DSH_SERVICE_NAME.service"
 DSH_SERVICE_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$DSH_SERVICE_UNIT_NAME"
 DSH_SERVICE_DSH_BIN="$DSH_SERVICE_LOCAL_BIN/dsh"
 
+# dsh 的默认通道：上游把「最新可用构建」放在 npm dist-tag next 上（latest 常常落后），
+# 因此省略目标时统一跟随 next；用 `dshctl upgrade latest` 或具体版本可显式覆盖。
+# 与 install.sh 安装器主体的 DSH_DEFAULT_CHANNEL 保持一致（两段脚本不能互相 source）。
+DSH_DEFAULT_CHANNEL='next'
+
 if [ -t 1 ]; then
 	C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_RESET=$'\033[0m'
 else
@@ -148,10 +153,10 @@ dshctl —— DeepSeek Harness 服务管理工具
   doctor [--fix]                 环境自检（--fix 修复可自动修复项）
 
 维护
-  upgrade [latest|<版本>] [--check] [--yes] [--no-restart]
-                                 升级 @deepseek-ai/dsh（失败自动回滚）
+  upgrade [next|<版本>] [--check] [--yes] [--no-restart]
+                                 升级 @deepseek-ai/dsh（默认通道 next；失败自动回滚）
   upgrade --list [N]             列出 registry 上的可用版本（最新在前，标记 dist-tag）
-  upgrade-node [<主版本>]        升级 Node 并重装 dsh/pnpm、重写单元
+  upgrade-node [<主版本>]        升级 Node 并重装 dsh（默认通道 next）/pnpm、重写单元
   run [-- 参数...]               前台运行 dsh web（不走 systemd，便于调试）
   plugins list                   列出当前 profile 已安装的插件
   plugins reset [--yes] [--no-restart]
@@ -1009,11 +1014,38 @@ cmd_doctor() {
 }
 
 # ── 升级 ─────────────────────────────────────────────────────────────────────
+# 把 dist-tag（next/latest/alpha 等）解析为 registry 上指向的具体版本；
+# 具体版本号（v0.1.6 / 0.1.6）原样返回、不访问网络；查询失败或没有该 tag 时输出空。
+# 与安装器主体的同名函数保持一致。
+resolve_dist_tag() {
+	local spec="${1:-}" tags value
+	case "$spec" in
+		v[0-9]*|[0-9]*) strip_v_prefix "$spec"; return 0 ;;
+	esac
+	tags="$(npm view @deepseek-ai/dsh dist-tags --json 2>/dev/null || true)"
+	if [ -z "$tags" ]; then
+		# registry 查询失败：无法判断该 tag 是否存在，用退出码 2 让调用方区分。
+		return 2
+	fi
+	# `|| true`：awk 命中后提前退出可能让上游 tr 收到 SIGPIPE，pipefail 下不应因此失败。
+	value="$(printf '%s' "$tags" | tr -d '{}"' | tr ',' '\n' | tr ':' ' ' \
+		| awk -v k="$spec" '$1 == k { print $2; exit }' || true)"
+	printf '%s\n' "$value"
+}
+
 resolve_target() {
-	local spec="$1" resolved
-	if [ "$spec" = latest ] || [ -z "$spec" ]; then
-		resolved="$(npm view @deepseek-ai/dsh version 2>/dev/null | tail -n 1 || true)"
-	else
+	local spec="${1:-}" resolved
+	if [ -z "$spec" ]; then
+		spec="$DSH_DEFAULT_CHANNEL"
+	fi
+	# 具体版本号不查网络；dist-tag 需要查询 registry 解析成具体版本。
+	case "$spec" in
+		v[0-9]*|[0-9]*) strip_v_prefix "$spec"; return 0 ;;
+	esac
+	# registry 查询失败（退出码 2）时输出空并返回 1，由调用方报错退出；查询成功但没有
+	# 该 tag 时按字面 spec 交给装前校验/安装，由其给出「版本不存在」提示。
+	resolved="$(resolve_dist_tag "$spec")" || return 1
+	if [ -z "$resolved" ]; then
 		resolved="$spec"
 	fi
 	# 用户与 npm view 都可能给带 v 前缀的版本号；统一成裸 semver 再比较，
@@ -1040,11 +1072,10 @@ rollback_upgrade() {
 }
 
 # ── upgrade：版本查询与装前校验 ──────────────────────────────────────────────
-# 解析 registry 上的最新版本（查询失败时输出空）。
-upgrade_latest_version() {
+# 解析默认通道（next）当前指向的版本（查询失败时输出空）。
+upgrade_channel_version() {
 	local v
-	v="$(npm view @deepseek-ai/dsh version 2>/dev/null | tail -n 1 || true)"
-	v="$(printf '%s' "$v" | tr -d '[:space:]')"
+	v="$(resolve_dist_tag "$DSH_DEFAULT_CHANNEL" || true)"
 	strip_v_prefix "$(normalize_version "$v")"
 }
 
@@ -1054,16 +1085,16 @@ upgrade_registry_hint() {
 	warn "网络不可用时请检查代理设置，或稍后重试"
 }
 
-# 版本或 dist-tag 不存在时的提示：指明目标、当前最新版与查看全部版本的命令。
+# 版本或 dist-tag 不存在时的提示：指明目标、默认通道当前版本与查看全部版本的命令。
 upgrade_target_not_found_hint() {
-	local target="$1" latest
+	local target="$1" channel
 	err "版本 $target 在 registry 上不存在（没有该版本或 dist-tag）。"
-	latest="$(upgrade_latest_version)"
-	if [ -n "$latest" ]; then
-		printf '  当前最新版本: %s\n' "$latest" >&2
+	channel="$(upgrade_channel_version)"
+	if [ -n "$channel" ]; then
+		printf '  默认通道 %s 当前版本: %s\n' "$DSH_DEFAULT_CHANNEL" "$channel" >&2
 	fi
 	printf '  查看可用版本: dshctl upgrade --list\n' >&2
-	printf '  安装最新版本: dshctl upgrade\n' >&2
+	printf '  安装默认通道版本: dshctl upgrade\n' >&2
 }
 
 # upgrade_list_versions：列出 registry 上 @deepseek-ai/dsh 的可用版本（最新在前），
@@ -1150,7 +1181,7 @@ upgrade_validate_target() {
 }
 
 cmd_upgrade() {
-	local spec='latest' check=0 no_restart=0 list=0 list_limit=20
+	local spec="$DSH_DEFAULT_CHANNEL" spec_explicit=0 check=0 no_restart=0 list=0 list_limit=20
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--check) check=1; shift ;;
@@ -1176,9 +1207,9 @@ cmd_upgrade() {
 					0) die "upgrade --list: 数量必须大于 0" ;;
 				esac
 				;;
-			latest|--latest) spec=latest; shift ;;
+			latest|--latest) spec=latest; spec_explicit=1; shift ;;
 			-*) die "upgrade: 未知参数 $1" ;;
-			*) spec="$1"; shift ;;
+			*) spec="$1"; spec_explicit=1; shift ;;
 		esac
 	done
 
@@ -1205,7 +1236,8 @@ cmd_upgrade() {
 	fi
 
 	# 显式指定的版本/dist-tag：装前先确认它确实存在，避免只给用户看 npm 的 ETARGET。
-	if [ "$spec" != latest ]; then
+	# 省略目标时走默认通道，目标已由 registry 解析得到，无需重复校验。
+	if [ "$spec_explicit" = 1 ]; then
 		upgrade_validate_target "$target" || return 1
 	fi
 
@@ -1276,10 +1308,16 @@ cmd_upgrade_node() {
 		fi
 	fi
 
-	local dsh_ver new_bin pnpm_ver
+	local dsh_ver dsh_target new_bin pnpm_ver
 	dsh_ver="$(installed_dsh_version 2>/dev/null || true)"
 	if [ -z "$dsh_ver" ]; then
 		die "未检测到已安装的 dsh，请先运行 install.sh"
+	fi
+	# 重装目标跟随默认通道（与 install.sh / dshctl upgrade 一致），而不是固定在换 Node
+	# 之前的旧版本。无法解析（registry 不可达）时中止，避免静默装成别的版本。
+	dsh_target="$(resolve_target "$DSH_DEFAULT_CHANNEL" || true)"
+	if [ -z "$dsh_target" ]; then
+		die "无法解析默认通道 $DSH_DEFAULT_CHANNEL 的目标版本（registry 不可用？），请检查网络后重试"
 	fi
 	# pnpm 与 dsh 一样装在「当前 Node 版本」的全局 npm 前缀下：换 Node 后旧版本
 	# 的 pnpm 不会自动出现，这里按升级前的版本重装（失败只告警，不阻断升级）。
@@ -1293,8 +1331,8 @@ cmd_upgrade_node() {
 	with_loose_shell nvm use --silent "$major" >/dev/null 2>&1 || true
 
 	new_bin="$(dirname -- "$(command -v node)")"
-	log "重装 @deepseek-ai/dsh@$dsh_ver 到 Node $major ..."
-	npm install -g "@deepseek-ai/dsh@$dsh_ver" || die "重装 dsh 失败"
+	log "重装 @deepseek-ai/dsh@$dsh_target（默认通道 $DSH_DEFAULT_CHANNEL，当前 $dsh_ver）到 Node $major ..."
+	npm install -g "@deepseek-ai/dsh@$dsh_target" || die "重装 dsh 失败"
 
 	if [ -n "$pnpm_ver" ]; then
 		log "重装 pnpm@$pnpm_ver 到 Node $major ..."
@@ -2177,7 +2215,7 @@ dsh-service 一键安装脚本
   --name NAME           systemd 单元名，不含 .service（默认 dsh）
   --node-major N        通过 nvm 安装的 Node 主版本（默认 24）
   --nvm-version V       nvm 版本标签（默认 v0.40.1）
-  --dsh-version V       @deepseek-ai/dsh 版本或 dist-tag（默认 latest）
+  --dsh-version V       @deepseek-ai/dsh 版本或 dist-tag（默认 next）
   --pnpm-version V      pnpm 版本或 dist-tag（默认 latest）
   --prefix DIR          用户级可执行目录（默认 $HOME/.local/bin）
   --mirror              使用国内镜像源（默认；npm/Node 走 npmmirror，nvm 走 Gitee）
@@ -2310,10 +2348,14 @@ if [ -z "$OPT_NODE_MAJOR" ] && [ -n "$DSH_SERVICE_NODE_BIN_DIR" ] && [ -x "$DSH_
 	esac
 fi
 NVM_VERSION="${OPT_NVM_VERSION:-v0.40.1}"
-DSH_VERSION="${OPT_DSH_VERSION:-latest}"
+# 默认通道：dsh 以 rc 版本对外发布，npm 的 latest 常常落后于 next，因此新安装默认
+# 跟随 next（与内嵌 dshctl 的 DSH_DEFAULT_CHANNEL 保持一致）。--dsh-version 可显式
+# 覆盖为 latest / 其他 dist-tag / 具体版本。
+DSH_DEFAULT_CHANNEL='next'
+DSH_VERSION="${OPT_DSH_VERSION:-$DSH_DEFAULT_CHANNEL}"
 # pnpm 与 dsh 同为可选全局包：默认 latest，可用 --pnpm-version / DSH_PNPM_VERSION 固定。
 PNPM_VERSION="${OPT_PNPM_VERSION:-${DSH_PNPM_VERSION:-latest}}"
-# 实际解析/安装到的版本（latest 会被解析成具体版本号），供末尾汇总显示。
+# 实际解析/安装到的版本（dist-tag 会被解析成具体版本号），供末尾汇总显示。
 RESOLVED_DSH_VERSION="$DSH_VERSION"
 RESOLVED_PNPM_VERSION="$PNPM_VERSION"
 EXTRA_ARGS="$DSH_SERVICE_EXTRA_ARGS"
@@ -2800,25 +2842,51 @@ strip_v_prefix() {
 	printf '%s\n' "${v#v}"
 }
 
+# 把 dist-tag（next/latest/alpha 等）解析为 registry 上指向的具体版本；
+# 具体版本号（v0.1.6 / 0.1.6）原样返回、不访问网络；查询失败或没有该 tag 时输出空。
+# 与内嵌 dshctl 的同名函数保持一致（两段脚本不能互相 source）。
+resolve_dist_tag() {
+	local spec="${1:-}" tags value
+	case "$spec" in
+		v[0-9]*|[0-9]*) strip_v_prefix "$spec"; return 0 ;;
+	esac
+	tags="$(npm view @deepseek-ai/dsh dist-tags --json 2>/dev/null || true)"
+	if [ -z "$tags" ]; then
+		# registry 查询失败：无法判断该 tag 是否存在，用退出码 2 让调用方区分。
+		return 2
+	fi
+	# `|| true`：awk 命中后提前退出可能让上游 tr 收到 SIGPIPE，pipefail 下不应因此失败。
+	value="$(printf '%s' "$tags" | tr -d '{}"' | tr ',' '\n' | tr ':' ' ' \
+		| awk -v k="$spec" '$1 == k { print $2; exit }' || true)"
+	printf '%s\n' "$value"
+}
+
 ensure_dsh() {
 	local current target
+	current=''
+	if command -v dsh >/dev/null 2>&1; then
+		current="$(normalize_version "$(dsh --version 2>/dev/null || true)")"
+	fi
+	# 默认通道只作用于新安装：未显式指定 --dsh-version（且未 --force）时，已有安装保持
+	# 原样，不跟随默认通道升级——与 Node 主版本的保留规则一致，切换通道是用户的显式动作。
+	if [ "$FORCE" != 1 ] && [ -z "$OPT_DSH_VERSION" ] && [ -n "$current" ]; then
+		log "dsh $current 已安装，保留现有版本（默认通道 $DSH_DEFAULT_CHANNEL；如需切换请用 --dsh-version $DSH_DEFAULT_CHANNEL 或 dshctl upgrade）"
+		RESOLVED_DSH_VERSION="$current"
+		return 0
+	fi
 	if [ "$DRY_RUN" = 1 ]; then
 		printf '[dry-run] npm install -g @deepseek-ai/dsh@%s\n' "$DSH_VERSION"
 		RESOLVED_DSH_VERSION="$DSH_VERSION"
 		return 0
 	fi
-	current=''
-	if command -v dsh >/dev/null 2>&1; then
-		current="$(normalize_version "$(dsh --version 2>/dev/null || true)")"
-	fi
-	target="$(strip_v_prefix "$DSH_VERSION")"
-	if [ "$target" = latest ]; then
-		# 解析 latest 的真实版本，避免重跑安装器时无条件重装/升级（幂等）。
-		target="$(normalize_version "$(npm view @deepseek-ai/dsh version 2>/dev/null | tail -n 1 || true)")"
-		if [ -z "$target" ]; then
-			warn "无法解析 @deepseek-ai/dsh 的 latest 版本（网络不可用？），将直接安装 latest"
-			target=latest
-		fi
+	target="$(resolve_dist_tag "$DSH_VERSION" || true)"
+	if [ -z "$target" ]; then
+		# 具体版本，或 registry 不可达时的字面 dist-tag：直接安装，交给 npm 解析。
+		target="$(strip_v_prefix "$DSH_VERSION")"
+		case "$DSH_VERSION" in
+			v[0-9]*|[0-9]*) ;;
+			*) warn "无法解析 @deepseek-ai/dsh 的 $DSH_VERSION 通道（网络不可用？），将直接安装 $DSH_VERSION" ;;
+		esac
 	fi
 	if [ "$FORCE" != 1 ] && [ -n "$current" ] && [ "$current" = "$target" ]; then
 		log "dsh $current 已安装，跳过"

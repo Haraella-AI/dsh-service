@@ -116,6 +116,15 @@ cat > "$WORK/node/bin/npm" <<'EOF'
 set -u
 # 记录生效的 registry，用于断言镜像设置确实传给了 npm。
 printf 'registry %s\n' "${npm_config_registry-}" >> "${STUB_NPM_ENV_LOG:-/dev/null}"
+# dist-tag → 版本的桩数据：view dist-tags 与 install <pkg>@<tag> 共用同一份。
+if [ -z "${STUB_NPM_DIST_TAGS:-}" ]; then
+	STUB_NPM_DIST_TAGS='{"latest":"0.2.0","next":"1.0.0-rc.1"}'
+fi
+# tag_version <tag>：从 JSON 桩数据里取出该 tag 指向的版本（没有则输出空）。
+tag_version() {
+	printf '%s' "$STUB_NPM_DIST_TAGS" | tr -d '{}"' | tr ',' '\n' | tr ':' ' ' \
+		| awk -v k="$1" '$1 == k { print $2; exit }'
+}
 case "${1:-}" in
 	prefix)
 		printf '%s\n' "$STUB_NODE_PREFIX"
@@ -144,7 +153,7 @@ case "${1:-}" in
 				exit 0
 				;;
 			dist-tags)
-				printf '%s\n' "${STUB_NPM_DIST_TAGS:-{\"latest\":\"0.2.0\",\"next\":\"1.0.0-rc.1\"}}"
+				printf '%s\n' "$STUB_NPM_DIST_TAGS"
 				exit 0
 				;;
 		esac
@@ -202,7 +211,15 @@ PNPM_STUB_EOF
 				;;
 		esac
 		ver="${spec##*@}"
-		if [ "$ver" = latest ]; then ver="${STUB_NPM_VIEW_VERSION:-1.0.0}"; fi
+		case "$ver" in
+			v[0-9]*|[0-9]*) ver="${ver#v}" ;;
+			*)
+				# dist-tag（next / latest / ...）：按桩的 dist-tags 映射为具体版本，
+				# 与真实 npm 安装 dist-tag 后写出的 package 版本一致。
+				tag_ver="$(tag_version "$ver")"
+				ver="${tag_ver:-${STUB_NPM_VIEW_VERSION:-1.0.0}}"
+				;;
+		esac
 		printf '%s\n' "$ver" > "$STUB_NODE_PREFIX/VERSION"
 		exit 0
 		;;
@@ -346,6 +363,11 @@ assert_contains '未知参数' "$(bash "$ROOT/install.sh" --with-build-tools 2>&
 
 # ── 2. dry-run 不产生任何文件 ────────────────────────────────────────────────
 section '2. dry-run 纯净性'
+# 模拟「机器上没有安装 dsh」：只暴露 node/npm，不暴露 dsh。
+NODSH_BIN="$WORK/no-dsh-bin"
+rm -rf "$NODSH_BIN"; mkdir -p "$NODSH_BIN"
+ln -sfn "$WORK/node/bin/node" "$NODSH_BIN/node"
+ln -sfn "$WORK/node/bin/npm" "$NODSH_BIN/npm"
 DRY_HOME="$WORK/dry-home"
 make_home "$DRY_HOME"
 BEFORE_LIST="$(find "$DRY_HOME" -mindepth 1 -printf '%p\n' | sort)"
@@ -355,8 +377,14 @@ assert_eq "$DRY_RC" '0' 'dry-run 退出 0'
 AFTER_LIST="$(find "$DRY_HOME" -mindepth 1 -printf '%p\n' | sort)"
 NEW_FILES="$(comm -13 <(printf '%s\n' "$BEFORE_LIST") <(printf '%s\n' "$AFTER_LIST"))"
 assert_eq "$NEW_FILES" '' 'dry-run 未创建新文件'
-assert_contains '[dry-run] npm install -g @deepseek-ai/dsh@latest' "$DRY_OUT" 'dry-run 打印 npm 安装动作'
-assert_contains '[dry-run] npm install -g pnpm@latest' "$DRY_OUT" 'dry-run 打印 pnpm 安装动作'
+# PATH 上已有 dsh（桩 0.1.0）且未显式指定版本：dry-run 报告保留，而不是安装。
+assert_contains 'dsh 0.1.0 已安装，保留现有版本' "$DRY_OUT" 'dry-run 报告保留已有安装'
+assert_not_contains '[dry-run] npm install -g @deepseek-ai/dsh@' "$DRY_OUT" '已有安装的 dry-run 不打印 dsh 安装动作'
+# 机器上没有 dsh：默认安装通道为 next。
+DRY_FRESH_OUT="$(HOME="$DRY_HOME" PATH="$WORK/bin:$NODSH_BIN:/usr/bin:/bin" \
+	bash "$ROOT/install.sh" --dry-run 2>&1)"
+assert_contains '[dry-run] npm install -g @deepseek-ai/dsh@next' "$DRY_FRESH_OUT" '未安装 dsh 时 dry-run 安装默认通道 next'
+assert_contains '[dry-run] npm install -g pnpm@latest' "$DRY_FRESH_OUT" 'dry-run 打印 pnpm 安装动作'
 assert_not_contains "$DRY_HOME/.dsh" "$AFTER_LIST" 'dry-run 未创建 DSH_HOME'
 assert_not_contains '编译工具' "$DRY_OUT" 'dry-run 不包含编译工具链步骤'
 # 全新安装（无 --node-major、无已记录 Node）默认请求 Node 24。
@@ -517,9 +545,29 @@ assert_contains 'install @deepseek-ai/dsh@0.2.0' "$NPM_LOG" '尝试安装新版�
 assert_contains 'install @deepseek-ai/dsh@0.1.0' "$NPM_LOG" '回滚到旧版本'
 assert_eq "$(cat "$WORK/node/VERSION")" '0.1.0' 'VERSION 保持旧版本'
 
-section '6b. upgrade --check'
+section '6b. upgrade 默认通道 next 与 --check'
+# 省略目标：默认通道 next（dist-tags next=1.0.0-rc.1），而不是 latest=0.2.0。
 CHECK_OUT="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" upgrade --check 2>&1)"
-assert_contains '可升级: 0.1.0 -> 0.2.0' "$CHECK_OUT" 'upgrade --check 报告可升级'
+assert_contains '可升级: 0.1.0 -> 1.0.0-rc.1' "$CHECK_OUT" 'upgrade --check 的默认目标为 next'
+assert_not_contains '可升级: 0.1.0 -> 0.2.0' "$CHECK_OUT" '默认目标不再是 latest'
+
+# 省略目标实际安装：装的是 next 指向的版本。
+: > "$STUB_NPM_LOG"
+UPNEXT_RC=0
+UPNEXT_OUT="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" upgrade --no-restart 2>&1)" || UPNEXT_RC=$?
+assert_eq "$UPNEXT_RC" '0' '省略目标的 upgrade 退出 0'
+assert_contains 'install @deepseek-ai/dsh@1.0.0-rc.1' "$(cat "$STUB_NPM_LOG")" '省略目标时安装 next 指向的版本'
+assert_contains '升级完成: 0.1.0 -> 1.0.0-rc.1' "$UPNEXT_OUT" '报告默认通道升级结果'
+printf '%s\n' '0.1.0' > "$WORK/node/VERSION"
+
+# 显式 latest：仍解析 dist-tags 的 latest。
+: > "$STUB_NPM_LOG"
+UPLATEST_RC=0
+UPLATEST_OUT="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" upgrade latest --no-restart 2>&1)" || UPLATEST_RC=$?
+assert_eq "$UPLATEST_RC" '0' '显式 latest 的 upgrade 退出 0'
+assert_contains 'install @deepseek-ai/dsh@0.2.0' "$(cat "$STUB_NPM_LOG")" '显式 latest 安装 latest 指向的版本'
+assert_contains '升级完成: 0.1.0 -> 0.2.0' "$UPLATEST_OUT" '显式 latest 报告安装结果'
+printf '%s\n' '0.1.0' > "$WORK/node/VERSION"
 
 section '6c. upgrade 目标版本带 v 前缀不误判'
 # 回归：dshctl upgrade v0.3.0（npm 接受 v 前缀，dsh --version 输出裸 semver）
@@ -560,8 +608,7 @@ else
 	ok '--list 0 退出非 0'
 fi
 # 未安装 dsh 的机器：只给 npm，不给 dsh，仍应能列出版本（且不触碰服务）。
-NODSH_BIN="$WORK/no-dsh-bin"
-rm -rf "$NODSH_BIN"; mkdir -p "$NODSH_BIN"
+mkdir -p "$NODSH_BIN"
 ln -sfn "$WORK/node/bin/npm" "$NODSH_BIN/npm"
 LIST_NODSH_RC=0
 LIST_NODSH_OUT="$(HOME="$HOME3" PATH="$WORK/bin:$NODSH_BIN:/usr/bin:/bin" \
@@ -584,7 +631,7 @@ unset STUB_NPM_NOTARGET_MATCH
 assert_eq "$NF_RC" '1' '不存在的版本退出 1'
 assert_contains '版本 1.7.0-rc.1 在 registry 上不存在' "$NF_OUT" '报告版本不存在'
 assert_contains 'dshctl upgrade --list' "$NF_OUT" '提示查看可用版本'
-assert_contains '当前最新版本' "$NF_OUT" '显示当前最新版本'
+assert_contains '默认通道 next 当前版本: 1.0.0-rc.1' "$NF_OUT" '显示默认通道当前版本'
 assert_eq "$(count_of 'install @deepseek-ai/dsh' "$(cat "$STUB_NPM_LOG")")" '0' '不存在的版本不尝试安装'
 
 # ── 6f. registry 不可达：校验不阻断安装 ──────────────────────────────────────
@@ -613,6 +660,31 @@ assert_contains '版本 0.9.0 在 registry 上不存在' "$G_OUT" '安装失败�
 assert_contains '服务未做任何改动' "$G_OUT" '报告现有安装未被改动'
 assert_eq "$(count_of 'install @deepseek-ai/dsh@0.1.0' "$(cat "$STUB_NPM_LOG")")" '0' '安装失败不触发回滚'
 assert_eq "$(find "$TMP_PROBE" -mindepth 1 | wc -l | tr -d ' ')" '0' '退出时清理安装输出临时文件'
+
+# ── 6h. 默认通道解析与不存在的 dist-tag ──────────────────────────────────────
+section '6h. 默认通道解析失败与不存在的 dist-tag'
+# 省略目标 + registry 不可达：无法解析默认通道，中止而不是静默装别的版本。
+: > "$STUB_NPM_LOG"
+export STUB_NPM_VIEW_FAIL=1
+NOCHAN_RC=0
+NOCHAN_OUT="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" upgrade --no-restart 2>&1)" || NOCHAN_RC=$?
+unset STUB_NPM_VIEW_FAIL
+assert_eq "$NOCHAN_RC" '1' 'registry 不可达且省略目标时退出 1'
+assert_contains '无法解析目标版本' "$NOCHAN_OUT" '报告无法解析默认通道目标'
+assert_eq "$(count_of 'install @deepseek-ai/dsh' "$(cat "$STUB_NPM_LOG")")" '0' \
+	'默认通道解析失败时不尝试安装'
+
+# 不存在的 dist-tag：registry 查询成功但没有该 tag，仍走「版本不存在」提示。
+: > "$STUB_NPM_LOG"
+export STUB_NPM_NOTARGET_MATCH='bogus-tag'
+BT_RC=0
+BT_OUT="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" upgrade bogus-tag --no-restart 2>&1)" || BT_RC=$?
+unset STUB_NPM_NOTARGET_MATCH
+assert_eq "$BT_RC" '1' '不存在的 dist-tag 退出 1'
+assert_contains '版本 bogus-tag 在 registry 上不存在' "$BT_OUT" '报告 dist-tag 不存在'
+assert_contains '默认通道 next 当前版本' "$BT_OUT" '提示默认通道当前版本'
+assert_eq "$(count_of 'install @deepseek-ai/dsh' "$(cat "$STUB_NPM_LOG")")" '0' \
+	'不存在的 dist-tag 不尝试安装'
 
 # ── 7. doctor ────────────────────────────────────────────────────────────────
 section '7. dshctl doctor'
@@ -734,27 +806,85 @@ assert_contains 'nvm 缺失' "$FIX_NO_NVM" '报告 nvm 缺失'
 assert_contains '通过' "$FIX_NO_NVM" 'nvm 缺失时仍输出汇总'
 assert_not_contains 'unbound variable' "$FIX_NO_NVM" '未因 nvm 缺失而中断'
 
-# ── 17. 默认 latest 安装幂等 ─────────────────────────────────────────────────
-section '17. 默认 latest 安装幂等'
+# ── 17. 默认通道 next 与保留已有安装 ─────────────────────────────────────────
+section '17. 默认通道 next 与保留已有安装'
 LATEST_HOME="$WORK/home-latest"
 make_home "$LATEST_HOME"
-export STUB_NPM_VIEW_VERSION='1.0.0'
+export STUB_NPM_VIEW_VERSION='0.2.0'
 printf '%s\n' '0.1.0' > "$WORK/node/VERSION"
 : > "$STUB_NPM_LOG"
-LATEST_OUT1="$(HOME="$LATEST_HOME" bash "$ROOT/install.sh" --no-linger 2>&1)"
-LATEST_N1="$(count_of 'install @deepseek-ai/dsh' "$(cat "$STUB_NPM_LOG")")"
-HOME="$LATEST_HOME" bash "$ROOT/install.sh" --no-linger >/dev/null 2>&1
-LATEST_N2="$(count_of 'install @deepseek-ai/dsh' "$(cat "$STUB_NPM_LOG")")"
-assert_eq "$LATEST_N1" '1' '首次安装 latest 执行一次 npm install'
-assert_eq "$LATEST_N2" '1' '重跑时已是最新，跳过 npm install'
-assert_contains '版本     : dsh 1.0.0' "$LATEST_OUT1" '汇总把 latest 显示为解析后的实际版本'
 
-# 回归：--dsh-version 带 v 前缀时，应与已安装的裸 semver 1.0.0 判为同一版本，
+# 17a 已有安装 + 未显式指定版本：保留现有版本，不跟随默认通道升级。
+LATEST_OUT1="$(HOME="$LATEST_HOME" bash "$ROOT/install.sh" --no-service 2>&1)"
+assert_eq "$(count_of 'install @deepseek-ai/dsh' "$(cat "$STUB_NPM_LOG")")" '0' \
+	'已有安装重跑不触发 npm install'
+assert_contains 'dsh 0.1.0 已安装，保留现有版本' "$LATEST_OUT1" '报告保留已安装版本'
+assert_contains '默认通道 next' "$LATEST_OUT1" '保留提示点名默认通道'
+assert_contains '版本     : dsh 0.1.0' "$LATEST_OUT1" '汇总显示保留的版本'
+
+# 17b 显式 --dsh-version next：按 dist-tags 解析出的具体版本安装。
+: > "$STUB_NPM_LOG"
+NEXT_OUT="$(HOME="$LATEST_HOME" bash "$ROOT/install.sh" --no-service --dsh-version next 2>&1)"
+assert_contains 'install @deepseek-ai/dsh@next' "$(cat "$STUB_NPM_LOG")" '显式 next 按默认通道安装'
+assert_contains '版本     : dsh 1.0.0-rc.1' "$NEXT_OUT" 'next 解析为 dist-tags 指向的版本'
+
+# 17c 已安装 next 指向的版本时，重跑显式 next 仍应跳过 npm install（dist-tag 幂等）。
+: > "$STUB_NPM_LOG"
+NEXT2_OUT="$(HOME="$LATEST_HOME" bash "$ROOT/install.sh" --no-service --dsh-version next 2>&1)"
+assert_eq "$(count_of 'install @deepseek-ai/dsh' "$(cat "$STUB_NPM_LOG")")" '0' \
+	'next 已安装时重跑跳过 npm install'
+assert_contains 'dsh 1.0.0-rc.1 已安装，跳过' "$NEXT2_OUT" 'dist-tag 解析后判为同一版本'
+
+# 17d --force：即使版本匹配也按默认通道重装。
+: > "$STUB_NPM_LOG"
+FORCE_OUT="$(HOME="$LATEST_HOME" bash "$ROOT/install.sh" --no-service --force 2>&1)"
+assert_contains 'install @deepseek-ai/dsh@next' "$(cat "$STUB_NPM_LOG")" '--force 按默认通道重装'
+assert_contains '版本     : dsh 1.0.0-rc.1' "$FORCE_OUT" '强制重装后汇总仍有版本'
+
+# 17e 回归：--dsh-version 带 v 前缀时，应与已安装的裸 semver 判为同一版本，
 # 否则重跑安装器会永远重装（幂等性失效）。
-VPFX_OUT="$(HOME="$LATEST_HOME" bash "$ROOT/install.sh" --no-linger --dsh-version v1.0.0 2>&1)"
-LATEST_N3="$(count_of 'install @deepseek-ai/dsh' "$(cat "$STUB_NPM_LOG")")"
-assert_eq "$LATEST_N3" '1' 'v 前缀 --dsh-version 不再触发重装'
+printf '%s\n' '1.0.0' > "$WORK/node/VERSION"
+: > "$STUB_NPM_LOG"
+VPFX_OUT="$(HOME="$LATEST_HOME" bash "$ROOT/install.sh" --no-service --dsh-version v1.0.0 2>&1)"
+assert_eq "$(count_of 'install @deepseek-ai/dsh' "$(cat "$STUB_NPM_LOG")")" '0' \
+	'v 前缀 --dsh-version 不再触发重装'
 assert_contains 'dsh 1.0.0 已安装，跳过' "$VPFX_OUT" 'v 前缀与裸 semver 判为同一版本'
+
+# 17f 全新机器（PATH 上没有 dsh）：默认安装 next。
+FRESH_HOME="$WORK/home-dsh-default"
+make_home "$FRESH_HOME"
+# 预置本地 Node 24：避免 nvm install 把 $WORK/node/bin 前置进 PATH、从而暴露出桩 dsh。
+mkdir -p "$FRESH_HOME/.nvm/versions/node/v24.99.0/bin"
+cat > "$FRESH_HOME/.nvm/versions/node/v24.99.0/bin/node" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then printf 'v24.99.0\n'; fi
+exit 0
+EOF
+chmod +x "$FRESH_HOME/.nvm/versions/node/v24.99.0/bin/node"
+printf '%s\n' '0.1.0' > "$WORK/node/VERSION"
+: > "$STUB_NPM_LOG"
+FRESH_RC=0
+FRESH_OUT="$(HOME="$FRESH_HOME" \
+	PATH="$WORK/bin:$NODSH_BIN:$FRESH_HOME/.nvm/versions/node/v24.99.0/bin:/usr/bin:/bin" \
+	bash "$ROOT/install.sh" --no-service 2>&1)" || FRESH_RC=$?
+assert_eq "$FRESH_RC" '0' '未安装 dsh 时安装退出 0'
+assert_contains 'install @deepseek-ai/dsh@next' "$(cat "$STUB_NPM_LOG")" '未安装 dsh 时默认安装 next'
+assert_eq "$(cat "$WORK/node/VERSION")" '1.0.0-rc.1' 'next 被解析为 dist-tags 指向的具体版本'
+assert_contains '版本     : dsh 1.0.0-rc.1' "$FRESH_OUT" '汇总显示 next 解析后的版本'
+printf '%s\n' '0.1.0' > "$WORK/node/VERSION"
+
+# 17g registry 不可达时的新安装：告警并回退为字面 next，安装不中止。
+rm -f "$FRESH_HOME/.local/bin/dsh"
+: > "$STUB_NPM_LOG"
+FRESHFAIL_RC=0
+FRESHFAIL_OUT="$(HOME="$FRESH_HOME" STUB_NPM_VIEW_FAIL=1 \
+	PATH="$WORK/bin:$NODSH_BIN:$FRESH_HOME/.nvm/versions/node/v24.99.0/bin:/usr/bin:/bin" \
+	bash "$ROOT/install.sh" --no-service 2>&1)" || FRESHFAIL_RC=$?
+assert_eq "$FRESHFAIL_RC" '0' 'registry 不可达时新安装仍成功'
+assert_contains '将直接安装 next' "$FRESHFAIL_OUT" 'registry 不可达时警告并回退字面通道'
+assert_contains 'install @deepseek-ai/dsh@next' "$(cat "$STUB_NPM_LOG")" '回退后仍安装字面 next'
+rm -f "$FRESH_HOME/.local/bin/dsh"
+printf '%s\n' '0.1.0' > "$WORK/node/VERSION"
 
 # ── 18. --print-dshctl 与源码内嵌段逐字节一致 ────────────────────────────────
 section '18. --print-dshctl 字节一致'
@@ -942,6 +1072,20 @@ assert_eq "$UPN_RC" '1' 'Node 下载失败时 upgrade-node 退出非 0'
 assert_contains 'nvm install 22 失败' "$UPN_OUT" 'upgrade-node 给出可读失败信息'
 assert_not_contains 'unbound variable' "$UPN_OUT" 'upgrade-node 不再以 unbound variable 崩溃'
 assert_eq "$(count_of 'install -b 22' "$(cat "$STUB_NVM_LOG")")" '2' 'upgrade-node 按次数重试'
+
+# ── 28b. dshctl upgrade-node 按默认通道重装 dsh ──────────────────────────────
+section '28b. dshctl upgrade-node 按默认通道重装 dsh'
+reset_nvm_log
+: > "$STUB_NPM_LOG"
+printf '%s\n' '0.1.0' > "$WORK/node/VERSION"
+UOK_RC=0
+UOK_OUT="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" upgrade-node 22 2>&1)" || UOK_RC=$?
+assert_eq "$UOK_RC" '0' 'Node 安装成功时 upgrade-node 退出 0'
+assert_contains 'install @deepseek-ai/dsh@1.0.0-rc.1' "$(cat "$STUB_NPM_LOG")" \
+	'upgrade-node 重装默认通道 next 指向的版本'
+assert_contains '默认通道 next' "$UOK_OUT" 'upgrade-node 报告默认通道'
+printf '%s\n' '0.1.0' > "$WORK/node/VERSION"
+rm -f "$HOME3/.stub-node-version"
 
 # ── 29. dshctl plugins list / reset（保留配置） ───────────────────────────────
 section '29. dshctl plugins list / reset'

@@ -50,7 +50,7 @@ cd dsh-service && bash install.sh
 | 0 | 端口预检 | 安装前检查 `--port`（默认 3080）是否被占用；被占用则自动改用后续空闲端口并写回配置（`--strict-port` 改为直接报错退出） |
 | 1 | 安装 nvm | 未检测到 `~/.nvm/nvm.sh` 时下载 `nvm-sh/nvm/v0.40.1/install.sh` 到临时文件后执行；默认从 Gitee 镜像（`https://gitee.com/mirrors/nvm`）获取，`--no-mirror` 时走 `raw.githubusercontent.com`。打印脚本 `sha256`，可用 `DSH_NVM_INSTALL_SHA256` 固定校验（两处内容一致） |
 | 2 | 安装 Node 24 | `nvm install -b 24`、`nvm alias default 24`、`nvm use --silent 24`。`-b` 表示二进制下载失败时**不**静默转为源码编译；失败按 `DSH_SERVICE_NODE_ATTEMPTS`（默认 3 次）重试。`~/.nvm` 下已有同主版本时直接复用，不再联网解析版本。**重跑不会迁移现有安装**：配置里记录了 Node 二进制目录时，未显式传 `--node-major` 就沿用该主版本（Node 22 仍受支持，下限为 22；要升级用 `dshctl upgrade-node 24` 或 `install.sh --node-major 24`） |
-| 3 | 安装 dsh | `npm install -g @deepseek-ai/dsh@latest`（默认经 npmmirror registry，`--no-mirror` 为官方 registry）；若已是最新版本则跳过（`--force` 强制重装，`--dsh-version` 可指定版本） |
+| 3 | 安装 dsh | `npm install -g @deepseek-ai/dsh@next`（**默认通道 next**：上游把最新构建放在 dist-tag `next` 上，`latest` 常常落后；默认经 npmmirror registry，`--no-mirror` 为官方 registry）。**重跑不会迁移已有安装**：未显式传 `--dsh-version` 时保留已安装版本，只有新安装才走 next；`--dsh-version latest` 或 `dshctl upgrade latest` 可切回 latest，`--force` 强制重装 |
 | 4 | 安装 pnpm | `npm install -g pnpm@latest`（同上走镜像 registry）；已安装同版本则跳过（`--pnpm-version` 指定版本，`--no-pnpm` 跳过）。pnpm 是可选的附加工具：安装失败只告警，不影响 dsh 服务 |
 | 5 | 用户级入口 | `~/.local/bin/dsh` → 全局 dsh 的符号链接；写入 `~/.local/bin/dshctl` |
 | 6 | shell 配置 | 在 `~/.bashrc` 写入带标记的块：`NVM_DIR`、nvm 加载、`~/.local/bin` 入 PATH；重跑时若 `--prefix` 等取值变化会重写该块（`--no-rc` 可跳过） |
@@ -90,9 +90,9 @@ cd dsh-service && bash install.sh
 | `dshctl doctor [--fix]` | 环境自检；`--fix` 修复可自动修复项 |
 | `dshctl version` | 版本信息 |
 | `dshctl config [edit]` | 查看 / 编辑配置 |
-| `dshctl upgrade [latest\|<版本>] [--check] [--yes] [--no-restart]` | 升级 dsh（见下） |
+| `dshctl upgrade [next\|<版本>] [--check] [--yes] [--no-restart]` | 升级 dsh（省略目标时用默认通道 next，见下） |
 | `dshctl upgrade --list [N]` | 列出 registry 上的可用版本（最新在前，标记 dist-tag） |
-| `dshctl upgrade-node [<主版本>]` | 升级 Node，并重装 dsh、pnpm，重写单元 |
+| `dshctl upgrade-node [<主版本>]` | 升级 Node，并按默认通道 next 重装 dsh（pnpm 一并重装）、重写单元 |
 | `dshctl run [-- 参数...]` | 前台运行 `dsh web`，便于调试 |
 | `dshctl plugins list` | 列出当前 profile 已安装的插件 |
 | `dshctl plugins reset [--yes] [--no-restart]` | 移除当前 profile 全部已安装插件（保留配置，见下） |
@@ -214,20 +214,21 @@ dshctl logs -n 40 | grep -i proxy || echo "无代理相关诊断"
 dshctl upgrade --list           # 列出可用版本（最新在前，标记 latest/next 等 dist-tag，默认 20 条）
 dshctl upgrade --list 5         # 只看最近 5 个版本
 dshctl upgrade --check          # 只看是否有新版本
-dshctl upgrade                  # 升级到 latest 并重启服务
+dshctl upgrade                  # 升级到默认通道 next 并重启服务
+dshctl upgrade latest           # 显式升级到 latest（dist-tags 里的任意 tag 都可用）
 dshctl upgrade 0.1.5-rc.1       # 升级/切换到指定版本
-dshctl upgrade-node 24          # 换 Node 主版本并重装 dsh / pnpm
+dshctl upgrade-node 24          # 换 Node 主版本，并按默认通道 next 重装 dsh（pnpm 一并重装）
 ```
 
 `--list` 是只读查询：不安装、不重启服务，也不要求已安装 dsh，可用于确认某个版本或 dist-tag 是否存在。
 
 `--yes` 只是为脚本兼容而保留（该命令本身不提问）。
 
-显式指定的版本或 dist-tag 会**在安装前**先向 registry 校验：不存在时立即报错（退出 1），并提示 `dshctl upgrade --list` 与当前最新版本，不会去动已安装的 dsh。registry 不可达时只告警并继续安装；若 `npm install` 仍以「无匹配版本」失败，也会打印同一提示作为兜底。
+省略目标时 `upgrade` 跟随**默认通道 `next`**（查询 registry 的 dist-tags 解析成具体版本），与 `install.sh` 新安装的默认通道一致；`dshctl upgrade latest` 或具体版本可显式覆盖。默认通道解析失败（registry 不可达）时会报错退出 1，不会静默换成别的版本。显式指定的版本或 dist-tag 会**在安装前**先向 registry 校验：不存在时立即报错（退出 1），并提示 `dshctl upgrade --list` 与默认通道 `next` 的当前版本，不会去动已安装的 dsh。校验期间 registry 不可达时只告警并继续安装；若 `npm install` 仍以「无匹配版本」失败，也会打印同一提示作为兜底。
 
 `upgrade` 的流程是：记录当前版本 → 安装目标版本 → 校验版本 → 刷新入口 → 重启并等待 `active`；任何一步失败都会**自动回滚到之前的版本**并返回非 0。
 
-`upgrade-node` 会在换 Node 主版本后重装 dsh 与 pnpm（pnpm 与 dsh 一样装在当前 Node 的全局 npm 前缀下，换 Node 后需要重装；pnpm 重装失败只告警）。
+`upgrade-node` 会在换 Node 主版本后重装 dsh 与 pnpm（pnpm 与 dsh 一样装在当前 Node 的全局 npm 前缀下，换 Node 后需要重装；pnpm 重装失败只告警）。重装的 dsh 是**默认通道 `next` 指向的版本**，而不是升级前的旧版本；需要停在某个版本时请在该命令后用 `dshctl upgrade <版本>` 指定。
 
 ## 重置插件
 
@@ -339,14 +340,14 @@ bash install.sh --no-mirror                                    # 全部切回官
 
 **`dshctl upgrade <版本>` 报「版本在 registry 上不存在」**
 
-指定了 registry 上不存在的版本或 dist-tag（例如 `1.7.0-rc.1`）时，`upgrade` 会在安装前就拒绝，并给出当前最新版本与查看全部版本的命令，不会改动已安装的 dsh：
+指定了 registry 上不存在的版本或 dist-tag（例如 `1.7.0-rc.1`）时，`upgrade` 会在安装前就拒绝，并给出默认通道 `next` 的当前版本与查看全部版本的命令，不会改动已安装的 dsh：
 
 ```sh
 dshctl upgrade --list           # 看有哪些版本（最新在前，标记 latest/next 等 dist-tag）
-dshctl upgrade                  # 直接升到 latest
+dshctl upgrade                  # 直接升到默认通道 next
 ```
 
-如果提示的是「无法确认版本 X 是否存在（registry 查询失败）」，那是 registry/网络查询本身失败（代理、镜像不可达等），命令会继续尝试安装，不会因此阻断升级。
+如果提示的是「无法确认版本 X 是否存在（registry 查询失败）」，那是 registry/网络查询本身失败（代理、镜像不可达等），命令会继续尝试安装，不会因此阻断升级。省略目标时相反：连默认通道 `next` 都解析不出来会直接报「无法解析目标版本」并退出 1，此时改用 `dshctl upgrade <具体版本>` 可绕过通道解析。
 
 **登录链接拿不到**：token 只在服务启动时打印一次（cookie 有效期 30 天）。`dshctl logs -n 50` 查看，或 `dshctl url --wait 30`；仍拿不到就 `dshctl restart` 重新打印。
 
@@ -374,7 +375,7 @@ dsh 的网页工具在**直连**时会先解析域名并拒绝任何非公网结
 --name NAME           systemd 单元名（默认 dsh）
 --node-major N        Node 主版本（默认 24；已有安装重跑时沿用配置记录的现有主版本）
 --nvm-version V       nvm 版本标签（默认 v0.40.1）
---dsh-version V       @deepseek-ai/dsh 版本或 dist-tag（默认 latest）
+--dsh-version V       @deepseek-ai/dsh 版本或 dist-tag（默认 next；已有安装重跑时保留当前版本）
 --pnpm-version V      pnpm 版本或 dist-tag（默认 latest；也可用 DSH_PNPM_VERSION）
 --prefix DIR          用户级可执行目录（默认 $HOME/.local/bin）
 --mirror              使用国内镜像（默认；npm/Node 走 npmmirror，nvm 走 Gitee）
