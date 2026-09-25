@@ -22,6 +22,7 @@
   - [4.1 dshctl 命令](#41-dshctl-命令)
   - [4.2 文件位置](#42-文件位置)
   - [4.3 配置文件](#43-配置文件)
+  - [4.4 命令补全](#44-命令补全)
 - [5. 访问与配置](#5-访问与配置)
   - [5.1 远程访问](#51-远程访问)
   - [5.2 配置模型密钥](#52-配置模型密钥)
@@ -73,7 +74,7 @@ cd dsh-service && bash install.sh
 |---|---|---|
 | 1 | 端口预检 | 检查 `--port`（默认 3080）是否被占用；被占用则自动改用后续空闲端口并写回配置（`--strict-port` 改为直接报错退出） |
 | 2 | 安装依赖 | 安装 nvm、Node 与全局 `@deepseek-ai/dsh`（新安装默认通道为 dist-tag `next`）；`pnpm` 为可选的附加工具，安装失败只告警，不影响服务 |
-| 3 | 用户级入口 | 生成 `~/.local/bin/dsh` 与 `~/.local/bin/dshctl`，并在 `~/.bashrc` 写入带标记的 `NVM_DIR` / nvm 加载 / PATH 配置块（`--no-rc` 可跳过） |
+| 3 | 用户级入口 | 生成 `~/.local/bin/dsh` 与 `~/.local/bin/dshctl`，安装 bash 补全脚本到 `~/.local/share/bash-completion/completions/dshctl`（`--no-completion` 可跳过），并在 `~/.bashrc` 写入带标记的 `NVM_DIR` / nvm 加载 / PATH / 补全加载配置块（`--no-rc` 可跳过） |
 | 4 | systemd 单元 | 写入 `~/.config/systemd/user/dsh.service`，执行 `daemon-reload` 并 `enable --now` |
 | 5 | linger | `loginctl enable-linger $USER`，使服务在开机未登录时也能启动（`--no-linger` 可跳过） |
 | 6 | 校验 | 等待服务进入 `active`（启动即崩溃会报错），并从日志中取出登录链接 |
@@ -100,6 +101,7 @@ cd dsh-service && bash install.sh
 --no-service          只安装并写入单元，不启用/启动服务
 --no-linger           不设置 linger
 --no-rc               不修改 ~/.bashrc（nvm 官方安装脚本首次安装时仍会写 ~/.bashrc）
+--no-completion       不安装 bash 补全脚本（默认安装到用户数据目录）
 --force               强制重装 dsh 与 pnpm
 --strict-port         端口被占用时直接报错，不自动改用其它端口
 --dry-run             只打印动作，不做任何修改
@@ -131,6 +133,7 @@ cd dsh-service && bash install.sh
 | `dshctl export [-o FILE] [--no-sessions] [--with-secrets] [--no-attachments] [--force]` | 把服务配置与 DSH_HOME 导出为 tar.gz |
 | `dshctl import <归档.tar.gz> [--yes] [--no-config] [--no-restart] [--install-plugins] [--dry-run]` | 在新环境导入归档 |
 | `dshctl uninstall [--purge] [--remove-dsh-home] [--remove-node] [--yes]` | 卸载 |
+| `dshctl completion [bash]` | 输出 bash 补全脚本（安装由 `install.sh` 完成，见 [命令补全](#44-命令补全)） |
 
 ### 4.2 文件位置
 
@@ -138,6 +141,7 @@ cd dsh-service && bash install.sh
 |---|---|
 | `~/.local/bin/dshctl` | 服务管理工具 |
 | `~/.local/bin/dsh` | 指向全局 dsh 的稳定入口（不随 nvm 默认版本漂移） |
+| `~/.local/share/bash-completion/completions/dshctl` | bash 补全脚本（`XDG_DATA_HOME` 生效时跟随；`--no-completion` 不安装） |
 | `~/.config/dsh-service/config` | dshctl / install.sh 共用配置 |
 | `~/.config/systemd/user/dsh.service` | systemd 单元（改动前会备份为 `dsh.service.bak`） |
 | `~/.dsh/` | DSH_HOME：profile（插件在 `profiles/<profile>/`）、会话、凭证等 |
@@ -171,6 +175,25 @@ dshctl config edit && dshctl restart
 > **代理不在这里配置**：dsh 只读启动时的环境变量，用 systemd drop-in 注入，见 [配置代理](#53-配置代理)。
 >
 > 配置文件会被 shell `source` 执行（这是 `: "${VAR:=...}"` 语法的前提），等同一段可执行代码：请勿使用来自不可信来源的配置文件，也不要写入 `$(...)` / 反引号。
+
+### 4.4 命令补全
+
+`install.sh` 默认安装 bash 补全：脚本写到 `~/.local/share/bash-completion/completions/dshctl`，并在 `~/.bashrc` 的 dsh-service 代码块里加载。**新开终端**或执行 `exec bash` 后生效。目前只支持 bash；脚本不依赖 `bash-completion` 软件包，补全过程也不联网。
+
+```sh
+dshctl <TAB>              # 子命令
+dshctl upgrade -<TAB>     # 该命令接受的选项
+dshctl plugins <TAB>      # 二级子命令：list / ls / reset
+dshctl config <TAB>       # edit
+dshctl import <TAB>       # 归档文件路径
+dshctl export -o <TAB>    # 输出文件路径
+```
+
+- 补全项由 `dshctl` 的命令表统一生成，因此不会出现「补全提示了某个命令、敲下去却报未知命令」。
+- 隐藏的内部命令（`_render-config` / `_render-unit` / `_enable` / `_linger`）不出现在补全里。
+- `dshctl upgrade <TAB>` 只提示 `next` / `latest` 两个常用通道，**这只是提示**：registry 上任意 dist-tag 都可用，可用版本以 `dshctl upgrade --list` 为准。
+- 手动安装（例如没跑过 `install.sh`，或想放到别的目录）：`dshctl completion bash > <路径>`，再把该路径 `source` 进 `~/.bashrc`。
+- 两个开关互相独立：`--no-completion` 不安装脚本；`--no-rc` 不写 `~/.bashrc`（脚本仍会安装，可自行 source 一行）。
 
 ## 5. 访问与配置
 
@@ -324,8 +347,8 @@ dshctl import /tmp/dsh.tgz --yes --install-plugins   # 顺便重装 profile 插�
 ### 6.4 卸载
 
 ```sh
-dshctl uninstall                        # 停服务、删单元与入口
-dshctl uninstall --purge                # 连同配置和 ~/.bashrc 中的块一起清理
+dshctl uninstall                        # 停服务、删单元、入口与补全脚本
+dshctl uninstall --purge                # 连同配置和 ~/.bashrc 中的块一起清理（补全 source 行随之移除）
 dshctl uninstall --purge --remove-dsh-home   # 再删除 ~/.dsh（会话/凭证）
 ```
 

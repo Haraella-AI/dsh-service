@@ -220,6 +220,9 @@ DSH_SERVICE_PORT="$((10#$DSH_SERVICE_PORT))"
 DSH_SERVICE_UNIT_NAME="$DSH_SERVICE_NAME.service"
 DSH_SERVICE_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$DSH_SERVICE_UNIT_NAME"
 DSH_SERVICE_DSH_BIN="$DSH_SERVICE_LOCAL_BIN/dsh"
+# bash 补全脚本落点（派生值，不写入配置）。install.sh 主体里有一份同值副本
+# （两段脚本不能互相 source）；改这里就要同步 install.sh 的 COMPLETION_FILE。
+DSH_SERVICE_COMPLETION_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/dshctl"
 
 if [ -t 1 ]; then
 	C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_RESET=$'\033[0m'
@@ -232,48 +235,172 @@ warn() { printf '%sWARN%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 err()  { printf '%sERROR%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
+# =============================================================================
+#  命令表 —— 公开命令面的唯一来源
+#
+#  usage() 的帮助文本、公开子命令的分派、`completion bash` 生成的补全脚本都从这
+#  张表产生：新增或删除命令、选项，只改这里一处。
+#
+#  每行 8 个字段，以 ~ 分隔（任何字段文本里都不得出现 ~）：
+#    name~group~left~desc~flags~subs~positional~subflags
+#      name        分派用的命令名；留空表示纯帮助行（全局选项），不参与分派
+#      group       帮助分组标题；为空表示该组不打印标题（全局选项组）
+#      left        帮助左列（命令与参数），原样打印
+#      desc        帮助描述；渲染时按第 33 列规则决定同行还是另起一行
+#      flags       补全用的选项词表，以空格分隔；`-o=path` 表示该选项取值是文件路径
+#      subs        二级子命令词表（补全用）
+#      positional  位置参数补全类型：空 / file（文件路径）/ dist-tag（静态提示）
+#      subflags    二级子命令的选项，格式 `<子命令>=<选项词表>`，多个用逗号分隔
+#
+#  同一个命令可以占多行（如 upgrade 的两条帮助行）；补全按命令名聚合全部行的字段。
+# =============================================================================
+DSHCTL_FIELD_SEP='~'
+DSHCTL_COMMANDS=(
+	'start~服务控制~start~启动服务~~~~'
+	'stop~服务控制~stop~停止服务~~~~'
+	'restart~服务控制~restart~重启服务（先按配置重写 systemd 单元）~~~~'
+	'status~服务控制~status~查看服务状态~~~~'
+	'enable~服务控制~enable~开机自启并立即启动~~~~'
+	'disable~服务控制~disable~取消开机自启~~~~'
+	'url~查看~url [--plain] [--wait N]~打印带 token 的登录链接（--plain 去掉 token）~--plain --wait~~~'
+	'logs~查看~logs [-f] [-n N]~查看服务日志（journalctl 透传）~-f -n~~~'
+	'version~查看~version~版本信息~~~~'
+	'config~查看~config [edit]~查看 / 编辑配置文件~~edit~~'
+	'doctor~查看~doctor [--fix]~环境自检（--fix 修复可自动修复项）~--fix~~~'
+	'completion~查看~completion [bash]~输出 bash 补全脚本~-h --help~~~'
+	'upgrade~维护~upgrade [next|<版本>] [--check] [--yes] [--no-restart]~升级 @deepseek-ai/dsh（默认通道 next；失败自动回滚）~--check -y --yes --no-restart --list --latest~~dist-tag~'
+	'upgrade~维护~upgrade --list [N]~列出 registry 上的可用版本（最新在前，标记 dist-tag）~~~~~'
+	'upgrade-node~维护~upgrade-node [<主版本>]~升级 Node 并重装 dsh（默认通道 next）/pnpm、重写单元~~~~'
+	'run~维护~run [-- 参数...]~前台运行 dsh web（不走 systemd，便于调试）~~~~'
+	'plugins~维护~plugins list~列出当前 profile 已安装的插件~~list ls reset~~reset=-y --yes --no-restart'
+	'plugins~维护~plugins reset [--yes] [--no-restart]~移除全部已安装插件（保留配置）~~~~~'
+	'export~维护~export [-o FILE] [--no-sessions] [--with-secrets] [--no-attachments] [--force]~导出服务配置与 DSH_HOME（会话、附件等）为 tar.gz~-o=path --output=path --with-secrets --no-secrets --with-sessions --no-sessions --with-attachments --no-attachments --force -f -h --help~~~'
+	'import~维护~import <归档.tar.gz> [--yes] [--no-restart] [--install-plugins] [--dry-run]~在新环境导入归档（原文件就地备份）~-y --yes --no-config --no-restart --install-plugins --dry-run -h --help~~file~'
+	'uninstall~维护~uninstall [--purge] [--remove-dsh-home] [--remove-node] [--yes]~卸载服务~--purge --remove-dsh-home --remove-node -y --yes~~~'
+	'~~-h, --help~显示本帮助~-h --help~~~'
+	'~~-V, --version~显示 dshctl 版本~-V --version~~~'
+)
+
+# upgrade 位置参数的静态提示。它只是提示：registry 上任意 dist-tag 都可用，
+# 权威来源是 `dshctl upgrade --list`。
+DSHCTL_DIST_TAGS='next latest'
+
+# command_table_row：把一行拆成字段写入全局结果数组 TABLE_FIELDS。
+# 结果用全局传递，与 export_*/IMPORT_* 的约定一致（bash 的函数无法返回数组）。
+command_table_row() {
+	TABLE_FIELDS=()
+	local rest="$1"
+	while :; do
+		case "$rest" in
+			*"$DSHCTL_FIELD_SEP"*)
+				TABLE_FIELDS+=("${rest%%"$DSHCTL_FIELD_SEP"*}")
+				rest="${rest#*"$DSHCTL_FIELD_SEP"}"
+				;;
+			*)
+				TABLE_FIELDS+=("$rest")
+				break
+				;;
+		esac
+	done
+	return 0
+}
+
+# command_table_has：命令名是否在表里（name 为空的纯帮助行不算命令）。
+command_table_has() {
+	local row
+	for row in "${DSHCTL_COMMANDS[@]}"; do
+		command_table_row "$row"
+		if [ -n "${TABLE_FIELDS[0]}" ] && [ "${TABLE_FIELDS[0]}" = "$1" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# command_table_names：按表顺序输出公开命令名（去重，每行一个）。
+command_table_names() {
+	local row name seen=' '
+	for row in "${DSHCTL_COMMANDS[@]}"; do
+		command_table_row "$row"
+		name="${TABLE_FIELDS[0]}"
+		[ -n "$name" ] || continue
+		case "$seen" in
+			*" $name "*) continue ;;
+		esac
+		seen="$seen$name "
+		printf '%s\n' "$name"
+	done
+}
+
+# command_table_global_flags：name 为空的帮助行声明的全局选项（顶层补全用）。
+command_table_global_flags() {
+	local row flags out=''
+	for row in "${DSHCTL_COMMANDS[@]}"; do
+		command_table_row "$row"
+		[ -z "${TABLE_FIELDS[0]}" ] || continue
+		flags="${TABLE_FIELDS[4]}"
+		[ -n "$flags" ] || continue
+		out="${out:+$out }$flags"
+	done
+	printf '%s' "$out"
+}
+
+# command_table_aggregate：把某个命令所有行的字段聚合到 TABLE_CMD_* 全局变量，
+# 同一字段取第一个非空值。补全据此拿到该命令完整的选项、子命令与位置参数信息。
+command_table_aggregate() {
+	local row name
+	TABLE_CMD_GROUP=''
+	TABLE_CMD_FLAGS=''
+	TABLE_CMD_SUBS=''
+	TABLE_CMD_POS=''
+	TABLE_CMD_SUBFLAGS=''
+	for row in "${DSHCTL_COMMANDS[@]}"; do
+		command_table_row "$row"
+		name="${TABLE_FIELDS[0]}"
+		[ -n "$name" ] && [ "$name" = "$1" ] || continue
+		[ -n "$TABLE_CMD_GROUP" ] || TABLE_CMD_GROUP="${TABLE_FIELDS[1]}"
+		[ -n "$TABLE_CMD_FLAGS" ] || TABLE_CMD_FLAGS="${TABLE_FIELDS[4]}"
+		[ -n "$TABLE_CMD_SUBS" ] || TABLE_CMD_SUBS="${TABLE_FIELDS[5]}"
+		[ -n "$TABLE_CMD_POS" ] || TABLE_CMD_POS="${TABLE_FIELDS[6]}"
+		[ -n "$TABLE_CMD_SUBFLAGS" ] || TABLE_CMD_SUBFLAGS="${TABLE_FIELDS[7]}"
+	done
+	return 0
+}
+
+# usage：帮助文本由命令表渲染。排版规则（第 33 列）：左列是纯 ASCII 且
+# 2 + 字符数 < 33 时描述同行，否则左列单独一行、描述另起一行并缩进到第 33 列。
+# 之所以要按「纯 ASCII」分流：printf 的 %-31s 按字符补齐，而 CJK 占两个终端列，
+# 只有同行渲染的左列是纯 ASCII 时，字符数才等于列数，第 33 列才严格成立。
 usage() {
-	cat <<'EOF'
-dshctl —— DeepSeek Harness 服务管理工具
-
-用法: dshctl <命令> [选项]
-
-服务控制
-  start                          启动服务
-  stop                           停止服务
-  restart                        重启服务（先按配置重写 systemd 单元）
-  status                         查看服务状态
-  enable                         开机自启并立即启动
-  disable                        取消开机自启
-
-查看
-  url [--plain] [--wait N]       打印带 token 的登录链接（--plain 去掉 token）
-  logs [-f] [-n N]               查看服务日志（journalctl 透传）
-  version                        版本信息
-  config [edit]                  查看 / 编辑配置文件
-  doctor [--fix]                 环境自检（--fix 修复可自动修复项）
-
-维护
-  upgrade [next|<版本>] [--check] [--yes] [--no-restart]
-                                 升级 @deepseek-ai/dsh（默认通道 next；失败自动回滚）
-  upgrade --list [N]             列出 registry 上的可用版本（最新在前，标记 dist-tag）
-  upgrade-node [<主版本>]        升级 Node 并重装 dsh（默认通道 next）/pnpm、重写单元
-  run [-- 参数...]               前台运行 dsh web（不走 systemd，便于调试）
-  plugins list                   列出当前 profile 已安装的插件
-  plugins reset [--yes] [--no-restart]
-                                 移除全部已安装插件（保留配置）
-  export [-o FILE] [--no-sessions] [--with-secrets] [--no-attachments] [--force]
-                                 导出服务配置与 DSH_HOME（会话、附件等）为 tar.gz
-  import <归档.tar.gz> [--yes] [--no-restart] [--install-plugins] [--dry-run]
-                                 在新环境导入归档（原文件就地备份）
-  uninstall [--purge] [--remove-dsh-home] [--remove-node] [--yes]
-                                 卸载服务
-
-  -h, --help                     显示本帮助
-  -V, --version                  显示 dshctl 版本
-
-环境变量可临时覆盖配置，例如：DSH_SERVICE_PORT=4000 dshctl restart
-EOF
+	local row group left desc prev_group=''
+	printf 'dshctl —— DeepSeek Harness 服务管理工具\n'
+	printf '\n用法: dshctl <命令> [选项]\n'
+	for row in "${DSHCTL_COMMANDS[@]}"; do
+		command_table_row "$row"
+		group="${TABLE_FIELDS[1]}"
+		left="${TABLE_FIELDS[2]}"
+		desc="${TABLE_FIELDS[3]}"
+		if [ "$group" != "$prev_group" ]; then
+			printf '\n'
+			[ -z "$group" ] || printf '%s\n' "$group"
+			prev_group="$group"
+		fi
+		case "$left" in
+			*[!\ -~]*)
+				printf '  %s\n' "$left"
+				printf '  %-31s%s\n' '' "$desc"
+				;;
+			*)
+				if [ $((2 + ${#left})) -ge 33 ]; then
+					printf '  %s\n' "$left"
+					printf '  %-31s%s\n' '' "$desc"
+				else
+					printf '  %-31s%s\n' "$left" "$desc"
+				fi
+				;;
+		esac
+	done
+	printf '\n%s\n' '环境变量可临时覆盖配置，例如：DSH_SERVICE_PORT=4000 dshctl restart'
 }
 
 # ── 基础工具 ─────────────────────────────────────────────────────────────────
@@ -2443,7 +2570,10 @@ cmd_uninstall() {
 	if [ -f "$0" ] && [ "$0" != "$DSH_SERVICE_LOCAL_BIN/dshctl" ] && [ "$(basename -- "$0")" = dshctl ]; then
 		rm -f -- "$0" 2>/dev/null || true
 	fi
-	log "已移除服务单元、dsh 稳定入口与 dshctl"
+	# 补全脚本是安装产物（与 dshctl 同级）：默认卸载就删；rc 块里的 source 行随
+	# --purge 的块移除一起消失，残留时被 [ -r ... ] 守卫挡住。
+	rm -f -- "$DSH_SERVICE_COMPLETION_FILE" 2>/dev/null || true
+	log "已移除服务单元、dsh 稳定入口、dshctl 与补全脚本"
 
 	if [ "$purge" = 1 ]; then
 		rm -rf -- "$CONFIG_DIR"
@@ -2464,41 +2594,167 @@ cmd_uninstall() {
 	log "卸载完成。npm 全局包若需移除: npm uninstall -g @deepseek-ai/dsh"
 }
 
+# ── 补全脚本 ─────────────────────────────────────────────────────────────────
+# cmd_completion：`dshctl completion [shell]` 把补全脚本写到标准输出。
+# 部署（落盘到 bash-completion 用户目录、在 ~/.bashrc 中加载）由 install.sh 负责；
+# dshctl 不提供 completion install/uninstall 动词，避免出现第二个 .bashrc 写者。
+completion_usage() {
+	cat <<'EOF'
+dshctl completion —— 输出 bash 补全脚本
+
+用法: dshctl completion [shell]
+
+  bash                           把 bash 补全脚本写到标准输出（默认）
+
+说明:
+  * 目前只支持 bash。把输出 source 进当前 shell 即可启用；脚本不依赖
+    bash-completion 软件包，也不发起任何网络请求。
+  * install.sh 默认会把它安装到
+    ~/.local/share/bash-completion/completions/dshctl 并在 ~/.bashrc 的
+    dsh-service 代码块中加载，通常无需手工处理。
+  * `upgrade` 的位置参数提示 next/latest 只是提示：registry 上任意 dist-tag
+    都可用，可用版本以 dshctl upgrade --list 为准。
+EOF
+}
+
+cmd_completion() {
+	local shell="${1:-bash}"
+	case "$shell" in
+		-h|--help) completion_usage ;;
+		bash|'') completion_bash ;;
+		*)
+			err "completion: 暂只支持 bash（收到: $shell）"
+			return 2
+			;;
+	esac
+}
+
+# completion_bash：由命令表渲染 bash 补全脚本。输出必须确定性——同一份 dshctl
+# 重复生成要逐字节一致，因为 install.sh 用它落盘并做逐字节幂等比对。
+completion_bash() {
+	local names global_flags name
+	names="$(command_table_names | tr '\n' ' ')"
+	names="${names% }"
+	global_flags="$(command_table_global_flags)"
+	printf '%s\n' \
+		'# Bash completion script for dshctl' \
+		'# 由 `dshctl completion bash` 生成 —— 请勿手工编辑' \
+		'' \
+		'_dshctl_complete() {' \
+		'	local cur prev words cword cmd sub' \
+		'	COMPREPLY=()' \
+		'	# 所有展开都要在 set -u 下安全：数组用 ${arr[@]+...}，下标用 ${arr[i]:-}。' \
+		'	cur="${COMP_WORDS[COMP_CWORD]:-}"' \
+		'	prev="${COMP_WORDS[COMP_CWORD-1]:-}"' \
+		'	words=(${COMP_WORDS[@]+"${COMP_WORDS[@]}"})' \
+		'	cword="${COMP_CWORD:-0}"' \
+		''
+	printf '\tif [ "$cword" -le 1 ]; then\n'
+	printf '\t\tcase "$cur" in\n'
+	printf '\t\t\t-*) COMPREPLY=($(compgen -W "%s" -- "$cur")); return 0 ;;\n' "$global_flags"
+	printf '\t\tesac\n'
+	printf '\t\tCOMPREPLY=($(compgen -W "%s" -- "$cur"))\n' "$names"
+	printf '\t\treturn 0\n'
+	printf '\tfi\n\n'
+	printf '\tcmd="${words[1]:-}"\n'
+	printf '\tsub="${words[2]:-}"\n\n'
+	printf '\tcase "$cmd" in\n'
+	while IFS= read -r name; do
+		[ -n "$name" ] || continue
+		completion_bash_arm "$name"
+	done < <(command_table_names)
+	printf '\tesac\n\n\treturn 0\n}\n\ncomplete -F _dshctl_complete dshctl\n'
+}
+
+# completion_bash_arm：为一个命令生成 case 分支；没有任何可补内容就不生成。
+completion_bash_arm() {
+	command_table_aggregate "$1"
+	local f path_pat='' word_words=''
+	for f in ${TABLE_CMD_FLAGS}; do
+		case "$f" in
+			*=path)
+				# 取路径的选项：既要有取值补全（case "$prev"），本身也要能被补出来。
+				path_pat="${path_pat:+$path_pat|}$(printf '%s' "${f%%=*}")"
+				word_words="${word_words:+$word_words }${f%%=*}"
+				;;
+			*) word_words="${word_words:+$word_words }$f" ;;
+		esac
+	done
+	if [ -z "$path_pat" ] && [ -z "$word_words" ] && [ -z "$TABLE_CMD_SUBS" ] && [ -z "$TABLE_CMD_POS" ]; then
+		return 0
+	fi
+	printf '\t\t%s)\n' "$1"
+	if [ -n "$path_pat" ]; then
+		printf '\t\t\tcase "$prev" in\n'
+		printf '\t\t\t\t%s) COMPREPLY=($(compgen -f -- "$cur")); return 0 ;;\n' "$path_pat"
+		printf '\t\t\tesac\n'
+	fi
+	if [ -n "$word_words" ]; then
+		printf '\t\t\tif [[ "$cur" == -* ]]; then\n'
+		printf '\t\t\t\tCOMPREPLY=($(compgen -W "%s" -- "$cur")); return 0\n' "$word_words"
+		printf '\t\t\tfi\n'
+	fi
+	if [ -n "$TABLE_CMD_SUBS" ]; then
+		printf '\t\t\tif [ "$cword" -eq 2 ] && [[ "$cur" != -* ]]; then\n'
+		printf '\t\t\t\tCOMPREPLY=($(compgen -W "%s" -- "$cur")); return 0\n' "$TABLE_CMD_SUBS"
+		printf '\t\t\tfi\n'
+		completion_bash_subflags "${TABLE_CMD_SUBFLAGS}"
+	fi
+	case "${TABLE_CMD_POS}" in
+		file) printf '\t\t\tCOMPREPLY=($(compgen -f -- "$cur")); return 0\n' ;;
+		dist-tag) printf '\t\t\tCOMPREPLY=($(compgen -W "%s" -- "$cur")); return 0\n' "$DSHCTL_DIST_TAGS" ;;
+	esac
+	printf '\t\t\t;;\n'
+}
+
+# completion_bash_subflags：生成二级子命令的选项分支。参数形如
+# `reset=-y --yes --no-restart`，多个子命令之间用逗号分隔。
+completion_bash_subflags() {
+	local rest="$1" entry sname sflags
+	[ -n "$rest" ] || return 0
+	printf '\t\t\tcase "$sub" in\n'
+	while [ -n "$rest" ]; do
+		case "$rest" in
+			*,*) entry="${rest%%,*}"; rest="${rest#*,}" ;;
+			*) entry="$rest"; rest='' ;;
+		esac
+		sname="${entry%%=*}"
+		sflags="${entry#*=}"
+		printf '\t\t\t\t%s)\n' "$sname"
+		printf '\t\t\t\t\tif [[ "$cur" == -* ]]; then\n'
+		printf '\t\t\t\t\t\tCOMPREPLY=($(compgen -W "%s" -- "$cur")); return 0\n' "$sflags"
+		printf '\t\t\t\t\tfi\n'
+		printf '\t\t\t\t\t;;\n'
+	done
+	printf '\t\t\tesac\n'
+}
+
 # ── 入口 ─────────────────────────────────────────────────────────────────────
+# main：公开子命令在命令表里校验后分派给 `cmd_<名称>`（短横线换成下划线）；
+# 隐藏命令（install.sh 内部调用）与帮助/版本保持显式分支。
 main() {
-	local cmd="${1:-help}"
+	local cmd="${1:-help}" fn
 	if [ $# -gt 0 ]; then
 		shift
 	fi
 	case "$cmd" in
-		start) cmd_start "$@" ;;
-		stop) cmd_stop "$@" ;;
-		restart) cmd_restart "$@" ;;
-		status) cmd_status "$@" ;;
-		enable) cmd_enable "$@" ;;
-		disable) cmd_disable "$@" ;;
-		logs) cmd_logs "$@" ;;
-		url) cmd_url "$@" ;;
-		version) cmd_version "$@" ;;
-		config) cmd_config "$@" ;;
-		doctor) cmd_doctor "$@" ;;
-		upgrade) cmd_upgrade "$@" ;;
-		upgrade-node) cmd_upgrade_node "$@" ;;
-		run) cmd_run "$@" ;;
-		plugins) cmd_plugins "$@" ;;
-		export) cmd_export "$@" ;;
-		import) cmd_import "$@" ;;
-		uninstall) cmd_uninstall "$@" ;;
+		help|-h|--help) usage ;;
+		-V|--version) printf 'dshctl %s\n' "$DSHCTL_VERSION" ;;
 		_render-config) render_config "$@" ;;
 		_render-unit) render_unit "$@" ;;
 		_enable) internal_enable "$@" ;;
 		_linger) internal_linger "$@" ;;
-		help|-h|--help) usage ;;
-		-V|--version) printf 'dshctl %s\n' "$DSHCTL_VERSION" ;;
 		*)
-			err "未知命令: $cmd"
-			usage >&2
-			exit 2
+			# declare -F 守卫：命令表里的名称写错（或实现缺失）时，给出与未知命令
+			# 一致的报错与退出码，而不是泄漏 bash 的 127。
+			fn="cmd_${cmd//-/_}"
+			if command_table_has "$cmd" && declare -F "$fn" >/dev/null 2>&1; then
+				"$fn" "$@"
+			else
+				err "未知命令: $cmd"
+				usage >&2
+				exit 2
+			fi
 			;;
 	esac
 }
@@ -2517,6 +2773,7 @@ DRY_RUN=0
 NO_SERVICE=0
 NO_LINGER=0
 NO_RC=0
+NO_COMPLETION=0
 NO_PNPM=0
 FORCE=0
 ALLOW_ROOT=0
@@ -2552,6 +2809,7 @@ dsh-service 一键安装脚本
   --no-service          只安装并写入单元，不启用/启动服务
   --no-linger           不设置 loginctl linger（开机未登录时不自启）
   --no-rc               不修改 ~/.bashrc
+  --no-completion       不安装 bash 补全脚本（默认安装到用户数据目录）
   --force               即使已是最新版本也重新安装
   --strict-port         端口被占用时直接报错，不自动改用其它端口
   --dry-run             只打印将要执行的动作，不做任何修改
@@ -2612,6 +2870,7 @@ parse_args() {
 			--no-service) NO_SERVICE=1; shift ;;
 			--no-linger) NO_LINGER=1; shift ;;
 			--no-rc) NO_RC=1; shift ;;
+			--no-completion) NO_COMPLETION=1; shift ;;
 			--force) FORCE=1; shift ;;
 			--strict-port) STRICT_PORT=1; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
@@ -2706,8 +2965,8 @@ validate_options() {
 # ── 派生变量 ─────────────────────────────────────────────────────────────────
 # init_derived_values：由已校验的取值算出后续步骤要用的变量（单元名/路径、
 # dshctl 路径、生效版本），并处理「沿用已安装 Node 主版本」的幂等逻辑。
-# 设置：UNIT_NAME、UNIT_FILE、DSHCTL_BIN、NODE_MAJOR、NODE_MAJOR_KEPT、
-#       RESOLVED_DSH_VERSION、RESOLVED_PNPM_VERSION。
+# 设置：UNIT_NAME、UNIT_FILE、DSHCTL_BIN、COMPLETION_FILE、NODE_MAJOR、
+#       NODE_MAJOR_KEPT、RESOLVED_DSH_VERSION、RESOLVED_PNPM_VERSION。
 init_derived_values() {
 	local kept_major=''
 
@@ -2723,6 +2982,9 @@ init_derived_values() {
 	# 只要它非空，`nvm install` 就会以 “not compatible with the PREFIX
 	# environment variable” 直接失败（见 nvm.sh 的 nvm_do_install）。
 	LOCAL_BIN_DIR="${OPT_PREFIX:-$DSH_SERVICE_LOCAL_BIN}"
+	# bash 补全脚本落点。与内嵌 dshctl 的 DSH_SERVICE_COMPLETION_FILE 同值——
+	# 两段脚本不能互相 source，改一处必须同步另一处。
+	COMPLETION_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/dshctl"
 	NODE_MAJOR="${OPT_NODE_MAJOR:-$DEFAULT_NODE_MAJOR}"
 	NVM_VERSION="${OPT_NVM_VERSION:-$DEFAULT_NVM_VERSION}"
 	# 默认通道：dsh 以 rc 版本对外发布，npm 的 latest 常常落后于 next，因此新安装
@@ -3327,6 +3589,25 @@ install_tools() {
 		log "稳定入口: $LOCAL_BIN_DIR/dsh -> $gbin"
 	fi
 	write_file "$DSHCTL_BIN" "$DSHCTL_SRC" 0755
+	install_completion
+}
+
+# install_completion：把 `dshctl completion bash` 的输出落盘到 bash-completion 的
+# 用户级目录。内容由内嵌 dshctl 生成（唯一来源），write_file 负责幂等与原子替换；
+# --no-completion 只跳过这一步，不影响 rc 代码块的其它内容（--no-rc 单独管 rc）。
+install_completion() {
+	local completion_src
+	if [ "$NO_COMPLETION" = 1 ]; then
+		log "已跳过补全脚本安装（--no-completion）"
+		return 0
+	fi
+	if [ "$DRY_RUN" = 1 ]; then
+		printf '[dry-run] 生成并写入补全脚本 %s\n' "$COMPLETION_FILE"
+		return 0
+	fi
+	completion_src="$("$DSHCTL_BIN" completion bash)" \
+		|| die "无法生成补全脚本（$DSHCTL_BIN completion bash）"
+	write_file "$COMPLETION_FILE" "$completion_src" 0644
 }
 
 # ── 步骤 6：shell 配置 ───────────────────────────────────────────────────────
@@ -3345,6 +3626,11 @@ rc_block_content() {
 	fi
 	printf 'case ":$PATH:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac\n' \
 		"$(rc_q "$LOCAL_BIN_DIR")" "$(rc_q "$LOCAL_BIN_DIR")"
+	# bash 补全：只 source 我们自己的那一个文件（不去接管 bash-completion 的整个
+	# 目录）。[ -r ... ] 守卫让「卸载后残留本行」或「--no-completion 之后」都无害。
+	if [ "$NO_COMPLETION" != 1 ]; then
+		printf '[ -r %s ] && . %s\n' "$(rc_q "$COMPLETION_FILE")" "$(rc_q "$COMPLETION_FILE")"
+	fi
 	printf '%s\n' "$end"
 }
 
@@ -3550,6 +3836,11 @@ print_summary() {
 	printf '  单元     : %s\n' "$UNIT_FILE"
 	printf '  配置     : %s\n' "$CONFIG_FILE"
 	printf '  dshctl   : %s\n' "$DSHCTL_BIN"
+	if [ "$NO_COMPLETION" = 1 ]; then
+		printf '  补全     : 已跳过（--no-completion）\n'
+	else
+		printf '  补全     : %s\n' "$COMPLETION_FILE"
+	fi
 
 	if [ "$DRY_RUN" = 0 ] && [ "$NO_SERVICE" != 1 ] && [ "$SERVICE_OK" = 1 ]; then
 		login_url="$("$DSHCTL_BIN" url --wait "$DEFAULT_URL_WAIT_SEC" 2>/dev/null || true)"
@@ -3572,6 +3863,7 @@ print_summary() {
       dshctl upgrade         升级 dsh
       dshctl doctor          环境自检
       dshctl export          导出配置与会话（迁移到新环境用）
+  * bash 补全：新开终端或执行 `exec bash` 后生效（安装时加 --no-completion 可跳过）。
   * 远程访问（服务仅监听 127.0.0.1）：
       ssh -N -L 3080:127.0.0.1:3080 <主机>
       然后在本机浏览器打开 dshctl url 输出的链接。

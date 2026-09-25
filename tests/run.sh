@@ -1478,6 +1478,293 @@ else
 	ok '跳过 Git 钩子测试（未安装 git）'
 fi
 
+# ── 33. 命令表一致性守卫 ─────────────────────────────────────────────────────
+section '33. 命令表一致性守卫'
+# 命令表是公开命令面的唯一来源（帮助、分派、补全都由它产生），这一节守住表与实现
+# 一致。只读已导出的内嵌 dshctl（第 1 节产出），必要时用 HOME3 的 dshctl 做运行时探测。
+assert_file "$WORK/dshctl.embedded" '内嵌 dshctl 副本可用'
+
+dshctl_func_body() {
+	awk -v fn="$1" '$0 == fn "() {" {inside=1} inside {print} inside && /^}$/ {exit}' "$WORK/dshctl.embedded"
+}
+dshctl_flag_source() {  # $1=命令名 → 输出该命令（含其子命令）的参数解析来源
+	case "$1" in
+		export) dshctl_func_body cmd_export; dshctl_func_body export_parse_args ;;
+		import) dshctl_func_body cmd_import; dshctl_func_body import_parse_args ;;
+		plugins) dshctl_func_body cmd_plugins; dshctl_func_body cmd_plugins_reset ;;
+		'') cat "$WORK/dshctl.embedded" ;;   # 全局选项：可出现在任意分支
+		*) dshctl_func_body "cmd_${1//-/_}" ;;
+	esac
+}
+row_field() {  # $1=表的一行 $2=字段序号（1..8，以 ~ 分隔）
+	local rest="$1" i=1
+	while [ "$i" -lt "$2" ]; do
+		rest="${rest#*~}"
+		i=$((i + 1))
+	done
+	printf '%s' "${rest%%~*}"
+}
+
+TABLE_ROWS="$(awk '
+	/^DSHCTL_COMMANDS=\(/ {inside=1; next}
+	inside && /^\)$/ {inside=0}
+	inside {print}
+' "$WORK/dshctl.embedded" | sed -E "s/^[[:space:]]*'(.*)'$/\1/")"
+TABLE_CMD_COUNT="$(printf '%s\n' "$TABLE_ROWS" | grep -c '~' || true)"
+if [ "$TABLE_CMD_COUNT" -ge 19 ]; then ok '命令表可解析且条目数合理'; else bad "命令表条目数异常（$TABLE_CMD_COUNT）"; fi
+
+# 表 → 实现：每个命令都要有 cmd_<名称>（短横线换下划线）函数，分派才成立。
+TABLE_CMDS=''
+MISSING_FN=''
+while IFS= read -r row; do
+	[ -n "$row" ] || continue
+	name="$(row_field "$row" 1)"
+	[ -n "$name" ] || continue
+	case " $TABLE_CMDS " in
+		*" $name "*) continue ;;
+	esac
+	TABLE_CMDS="$TABLE_CMDS $name"
+	grep -qE "^cmd_${name//-/_}\(\) \{" "$WORK/dshctl.embedded" || MISSING_FN="$MISSING_FN $name"
+done <<<"$TABLE_ROWS"
+TABLE_CMDS="${TABLE_CMDS# }"
+TABLE_CMD_COUNT="$(printf '%s\n' $TABLE_CMDS | grep -c . || true)"
+assert_eq "$MISSING_FN" '' '命令表每条命令都有 cmd_* 实现'
+
+# 运行时：每个表命令都能被分派（用不存在的选项探测，解析失败发生在副作用之前）。
+# run 是透传命令，探测会把参数交给 dsh；其余命令都会在解析阶段报错。
+NOT_DISPATCHED=''
+for c in $TABLE_CMDS; do
+	out="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" "$c" --__probe 2>&1 || true)"
+	case "$out" in
+		*"未知命令"*) NOT_DISPATCHED="$NOT_DISPATCHED $c" ;;
+	esac
+done
+assert_eq "$NOT_DISPATCHED" '' '命令表每条命令都能被分派（未分派:$NOT_DISPATCHED）'
+if HOME="$HOME3" "$HOME3/.local/bin/dshctl" nope >/dev/null 2>&1; then bad '表外命令应退出 2'; else ok '表外命令退出非 0'; fi
+assert_contains '未知命令' "$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" nope 2>&1 || true)" '表外命令报告未知命令'
+
+# 帮助 ↔ 表：每条表命令都要出现在帮助里；每条描述都要从第 34 个字符列开始
+# （第 33 列规则：同行时左列补齐到 33 个字符，超宽或含 CJK 时另起一行缩进 33 个空格）。
+HELP_TEXT="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" --help 2>&1)"
+HELP_MISSING=''
+for c in $TABLE_CMDS; do
+	grep -qE "^  ${c}( |\$)" <<<"$HELP_TEXT" || HELP_MISSING="$HELP_MISSING $c"
+done
+assert_eq "$HELP_MISSING" '' '命令表每条命令都出现在帮助里（缺:$HELP_MISSING）'
+DESC_BAD=''
+while IFS= read -r row; do
+	[ -n "$row" ] || continue
+	desc="$(row_field "$row" 4)"
+	[ -n "$desc" ] || continue
+	grep -qE -- "^.{33}${desc}\$" <<<"$HELP_TEXT" || DESC_BAD="$DESC_BAD [$desc]"
+done <<<"$TABLE_ROWS"
+assert_eq "$DESC_BAD" '' '帮助描述统一从第 34 个字符列开始（异常:$DESC_BAD）'
+
+# 表 ↔ 参数解析（正向）：表里声明的每个长选项都要在该命令的解析代码里出现。
+FLAG_MISSING=''
+while IFS= read -r row; do
+	[ -n "$row" ] || continue
+	name="$(row_field "$row" 1)"
+	flags="$(row_field "$row" 5)"
+	subflags="$(row_field "$row" 8)"
+	[ -n "$flags$subflags" ] || continue
+	src="$(dshctl_flag_source "$name")"
+	for f in $flags ${subflags//,/ }; do
+		f="${f%%=*}"          # 去掉 -o=path / reset=--yes 里的标记
+		[ -n "$f" ] || continue
+		case "$f" in
+			--*) ;;
+			*) continue ;;
+		esac
+		grep -qE -- "(^|[[:space:]|])${f}[)|]" <<<"$src" || FLAG_MISSING="$FLAG_MISSING $name:$f"
+	done
+done <<<"$TABLE_ROWS"
+assert_eq "$FLAG_MISSING" '' '命令表里的长选项都在解析代码里（缺失:$FLAG_MISSING）'
+
+# 表 ↔ 参数解析（反向）：源码里解析的每个长选项都要进表——新加选项却忘了补全会被这里抓住。
+TABLE_ALL_FLAGS=' '
+while IFS= read -r row; do
+	[ -n "$row" ] || continue
+	fields="$(row_field "$row" 5) $(row_field "$row" 8)"
+	for f in $fields; do
+		f="${f%%=*}"
+		case "$f" in --*) TABLE_ALL_FLAGS="$TABLE_ALL_FLAGS$f " ;; esac
+	done
+done <<<"$TABLE_ROWS"
+ARM_FLAGS="$(grep -E '^[[:space:]]*[-a-zA-Z]+[)|]' "$WORK/dshctl.embedded" | grep -oE -- '--[a-z][a-z-]*' | sort -u)"
+UNCOVERED=''
+for f in $ARM_FLAGS; do
+	case "$TABLE_ALL_FLAGS" in
+		*" $f "*) ;;
+		*) UNCOVERED="$UNCOVERED $f" ;;
+	esac
+done
+assert_eq "$UNCOVERED" '' '被解析的长选项都进了命令表（漏:$UNCOVERED）'
+
+# 子帮助 ⊆ 表：三份散文式子帮助里列出的选项必须都在表里（它们不参与表渲染）。
+SUB_USAGE_FLAGS="$(for fn in plugins_usage export_usage import_usage; do
+	dshctl_func_body "$fn"
+done | grep -E '^[[:space:]]+-' | grep -oE -- '--[a-z][a-z-]*' | sort -u)"
+SUB_UNCOVERED=''
+for f in $SUB_USAGE_FLAGS; do
+	case "$TABLE_ALL_FLAGS" in
+		*" $f "*) ;;
+		*) SUB_UNCOVERED="$SUB_UNCOVERED $f" ;;
+	esac
+done
+assert_eq "$SUB_UNCOVERED" '' '子命令帮助里的选项都在命令表里（漏:$SUB_UNCOVERED）'
+
+# 隐藏命令不泄漏到表、帮助与补全输出。
+for h in _render-config _render-unit _enable _linger; do
+	assert_not_contains "$h" "$TABLE_ROWS" "命令表不含 $h"
+	assert_not_contains "$h" "$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" --help 2>&1)" "帮助不含 $h"
+done
+assert_contains '_render-unit' "$(cat "$WORK/dshctl.embedded")" '隐藏命令仍存在于源码（install.sh 依赖）'
+
+# ── 34. 补全生成与行为覆盖 ───────────────────────────────────────────────────
+section '34. 补全生成与行为覆盖'
+COMP_SCRIPT="$WORK/dshctl-completion.bash"
+HOME="$HOME3" "$HOME3/.local/bin/dshctl" completion bash > "$COMP_SCRIPT" 2>/dev/null
+if [ -s "$COMP_SCRIPT" ]; then ok 'completion bash 输出非空'; else bad 'completion bash 输出非空'; fi
+if bash -n "$COMP_SCRIPT" 2>/dev/null; then ok '补全脚本语法检查'; else bad '补全脚本语法检查'; fi
+assert_contains 'complete -F _dshctl_complete dshctl' "$(cat "$COMP_SCRIPT")" '补全脚本注册到 dshctl'
+assert_eq "$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" completion 2>/dev/null)" "$(cat "$COMP_SCRIPT")" 'completion 省略参数等价于 bash'
+
+HOME="$HOME3" "$HOME3/.local/bin/dshctl" completion bash > "$WORK/dshctl-completion.2.bash" 2>/dev/null
+if cmp -s "$COMP_SCRIPT" "$WORK/dshctl-completion.2.bash"; then ok '补全脚本输出确定性'; else bad '补全脚本输出确定性'; fi
+
+ZSH_RC=0
+ZSH_OUT="$(HOME="$HOME3" "$HOME3/.local/bin/dshctl" completion zsh 2>"$WORK/completion-zsh.err")" || ZSH_RC=$?
+assert_eq "$ZSH_RC" '2' '不支持的 shell 退出非 0'
+assert_eq "$ZSH_OUT" '' '不支持的 shell 不写标准输出'
+assert_contains 'bash' "$(cat "$WORK/completion-zsh.err")" '不支持的 shell 给出提示'
+
+# 非交互 bash -c 不加载 bash-completion：这里正好覆盖脚本自带的手动回退路径。
+if bash -c 'declare -F _init_completion >/dev/null 2>&1'; then
+	bad '测试环境意外加载了 bash-completion（手动回退路径未被覆盖）'
+else
+	ok '测试环境未加载 bash-completion（覆盖手动回退路径）'
+fi
+
+complete_reply() {  # $1=补全脚本，其余=COMP_WORDS 的各词；输出 COMPREPLY
+	local script="$1"
+	shift
+	bash -c '
+		. "$1" || exit 9
+		shift
+		COMP_WORDS=("$@")
+		COMP_CWORD=$(( $# - 1 ))
+		COMPREPLY=()
+		_dshctl_complete
+		printf "%s" "${COMPREPLY[*]}"
+	' _ "$script" "$@"
+}
+
+TOP_REPLY="$(complete_reply "$COMP_SCRIPT" dshctl '')"
+assert_contains 'plugins' "$TOP_REPLY" '顶层补全含 plugins'
+assert_contains 'uninstall' "$TOP_REPLY" '顶层补全含 uninstall'
+assert_contains 'completion' "$TOP_REPLY" '顶层补全含 completion'
+assert_eq "$(complete_reply "$COMP_SCRIPT" dshctl plugins '')" 'list ls reset' 'plugins 二级子命令补全'
+assert_eq "$(complete_reply "$COMP_SCRIPT" dshctl config '')" 'edit' 'config 二级子命令补全'
+assert_eq "$(complete_reply "$COMP_SCRIPT" dshctl upgrade -)" '--check -y --yes --no-restart --list --latest' 'upgrade 选项补全'
+assert_eq "$(complete_reply "$COMP_SCRIPT" dshctl upgrade '')" 'next latest' 'upgrade 位置参数给出通道提示'
+assert_eq "$(complete_reply "$COMP_SCRIPT" dshctl plugins reset -)" '-y --yes --no-restart' 'plugins reset 选项补全'
+assert_contains '--purge' "$(complete_reply "$COMP_SCRIPT" dshctl uninstall --)" 'uninstall 选项补全'
+assert_contains '--force' "$(complete_reply "$COMP_SCRIPT" dshctl export -)" 'export 选项补全'
+assert_eq "$(complete_reply "$COMP_SCRIPT" dshctl nope '')" '' '未知命令无候选'
+
+COMP_PATHS="$WORK/completion-paths"
+rm -rf "$COMP_PATHS"
+mkdir -p "$COMP_PATHS"
+: > "$COMP_PATHS/dsh-backup.tar.gz"
+: > "$COMP_PATHS/other.tgz"
+assert_eq "$(complete_reply "$COMP_SCRIPT" dshctl import "$COMP_PATHS/dsh")" \
+	"$COMP_PATHS/dsh-backup.tar.gz" 'import 位置参数补全文件路径'
+assert_eq "$(complete_reply "$COMP_SCRIPT" dshctl export -o "$COMP_PATHS/oth")" \
+	"$COMP_PATHS/other.tgz" 'export -o 取值补全文件路径'
+
+for h in _render-config _render-unit _enable _linger; do
+	assert_not_contains "$h" "$(complete_reply "$COMP_SCRIPT" dshctl _)" "补全候选不含 $h"
+done
+
+SETU_OUT="$(bash -c '
+	set -u
+	. "$1"
+	COMP_WORDS=(dshctl "")
+	COMP_CWORD=1
+	COMPREPLY=()
+	_dshctl_complete
+	printf "%s" "${#COMPREPLY[@]}"
+' _ "$COMP_SCRIPT" 2>&1)"
+assert_eq "$SETU_OUT" "$TABLE_CMD_COUNT" 'set -u 下补全可用且返回全部命令'
+
+# ── 35. 补全部署与卸载覆盖 ───────────────────────────────────────────────────
+section '35. 补全部署与卸载覆盖'
+COMP_HOME="$WORK/home-completion"
+COMP_FILE="$COMP_HOME/.local/share/bash-completion/completions/dshctl"
+make_home "$COMP_HOME"
+: > "$STUB_SYSTEMCTL_LOG"
+HOME="$COMP_HOME" bash "$ROOT/install.sh" --dsh-version 0.1.0 >/dev/null 2>&1
+assert_file "$COMP_FILE" '全新安装写入补全脚本'
+assert_eq "$(cat "$COMP_FILE")" "$(HOME="$COMP_HOME" "$COMP_HOME/.local/bin/dshctl" completion bash 2>/dev/null)" \
+	'补全脚本内容等于 dshctl completion bash 输出'
+assert_contains "$COMP_FILE" "$(cat "$COMP_HOME/.bashrc")" 'rc 块指向补全脚本'
+assert_contains '[ -r ' "$(cat "$COMP_HOME/.bashrc")" 'rc 块用守卫语句加载补全'
+
+COMP_HASH="$(sha256sum "$COMP_FILE" | awk '{print $1}')"
+COMP_RC_HASH="$(sha256sum "$COMP_HOME/.bashrc" | awk '{print $1}')"
+COMP_OUT2="$(HOME="$COMP_HOME" bash "$ROOT/install.sh" --dsh-version 0.1.0 2>&1)"
+assert_eq "$(sha256sum "$COMP_FILE" | awk '{print $1}')" "$COMP_HASH" '重跑后补全脚本哈希不变'
+assert_contains "未变化: $COMP_FILE" "$COMP_OUT2" '重跑报告补全脚本未变化'
+assert_eq "$(sha256sum "$COMP_HOME/.bashrc" | awk '{print $1}')" "$COMP_RC_HASH" '重跑后 rc 块逐字节不变'
+assert_eq "$(count_of '[ -r ' "$(cat "$COMP_HOME/.bashrc")")" '1' 'rc 块只有一行补全 source'
+
+# --no-completion：既不写脚本，也不加 source 行。
+NOC_HOME="$WORK/home-nocompletion"
+make_home "$NOC_HOME"
+HOME="$NOC_HOME" bash "$ROOT/install.sh" --dsh-version 0.1.0 --no-completion >/dev/null 2>&1
+if [ -e "$NOC_HOME/.local/share/bash-completion/completions/dshctl" ]; then
+	bad '--no-completion 不应写补全脚本'
+else
+	ok '--no-completion 不写补全脚本'
+fi
+assert_not_contains 'bash-completion/completions/dshctl' "$(cat "$NOC_HOME/.bashrc")" '--no-completion 时 rc 块不含补全行'
+
+# --no-rc：仍写脚本，但不碰 ~/.bashrc（两个开关互相独立）。
+NRC_HOME="$WORK/home-norc-completion"
+make_home "$NRC_HOME"
+NRC_RC_HASH="$(sha256sum "$NRC_HOME/.bashrc" | awk '{print $1}')"
+HOME="$NRC_HOME" bash "$ROOT/install.sh" --dsh-version 0.1.0 --no-rc >/dev/null 2>&1
+assert_file "$NRC_HOME/.local/share/bash-completion/completions/dshctl" '--no-rc 仍写入补全脚本'
+assert_eq "$(sha256sum "$NRC_HOME/.bashrc" | awk '{print $1}')" "$NRC_RC_HASH" '--no-rc 不修改 .bashrc'
+
+# --dry-run：报告路径但不创建文件。
+DRYC_HOME="$WORK/home-dry-completion"
+make_home "$DRYC_HOME"
+DRYC_OUT="$(HOME="$DRYC_HOME" bash "$ROOT/install.sh" --dry-run 2>&1)"
+assert_contains "生成并写入补全脚本 $DRYC_HOME/.local/share/bash-completion/completions/dshctl" "$DRYC_OUT" \
+	'dry-run 报告补全脚本路径'
+if [ -e "$DRYC_HOME/.local/share/bash-completion/completions/dshctl" ]; then
+	bad 'dry-run 不应创建补全脚本'
+else
+	ok 'dry-run 不创建补全脚本'
+fi
+
+# 卸载：补全脚本随入口点一起删；source 行随 --purge 的 rc 块移除。
+U_HOME="$WORK/home-uninstall-completion"
+U_FILE="$U_HOME/.local/share/bash-completion/completions/dshctl"
+make_home "$U_HOME"
+: > "$STUB_SYSTEMCTL_LOG"
+HOME="$U_HOME" bash "$ROOT/install.sh" --dsh-version 0.1.0 >/dev/null 2>&1
+assert_file "$U_FILE" '卸载前补全脚本存在'
+cp -p "$U_HOME/.local/bin/dshctl" "$WORK/dshctl-uninstall-copy"
+HOME="$U_HOME" "$U_HOME/.local/bin/dshctl" uninstall --yes >/dev/null 2>&1 || true
+if [ -e "$U_FILE" ]; then bad '默认卸载应删除补全脚本'; else ok '默认卸载删除补全脚本'; fi
+assert_contains '# >>> dsh-service >>>' "$(cat "$U_HOME/.bashrc")" '默认卸载保留 rc 块（含补全 source 行）'
+HOME="$U_HOME" bash "$WORK/dshctl-uninstall-copy" uninstall --purge --yes >/dev/null 2>&1 || true
+assert_not_contains '# >>> dsh-service >>>' "$(cat "$U_HOME/.bashrc")" '--purge 移除整个 rc 块'
+assert_not_contains 'bash-completion/completions/dshctl' "$(cat "$U_HOME/.bashrc")" '--purge 后 rc 块不含补全 source 行'
+
 # ── 汇总 ─────────────────────────────────────────────────────────────────────
 printf '\n通过 %d 项，失败 %d 项\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then
